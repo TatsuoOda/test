@@ -1,0 +1,36 @@
+#
+source function.sh
+
+F25I=1920x1080-25I-IPBBB.ts
+F25P=1920x1080-25P-IPBBB.ts
+H25I=1280x720-25I-IPBBB.ts
+H25P=1280x720-25P-IPBBB.ts
+H50P=1280x720-50P-IPBBB.ts
+S25I=720x576-25I.ts
+S25P=720x576-25P.ts
+S50P=720x576-50P.ts
+
+if [ x$1 = xx ]
+then
+#-----------
+# 25P-25P
+#-----------
+Connect ${F25P} ${H25P} F25P-25P.ts 3600
+Connect F25P-25P.ts ${H25P} F25P-25P-d-25P.ts 5400
+Connect F25P-25P-d-25P.ts ${F25P} F25P-25P-d-25P-F25P.ts 3600
+Connect F25P-25P-d-25P-F25P.ts F25P-25P-d-25P-F25P.ts F25P-25P-d-25P-F25P-d-F25P-25P-d-25P-F25P.ts 5400
+
+#-----------
+# 25P-25P
+#-----------
+Connect F25P-25P-d-25P-F25P.ts F25P-25P-d-25P-F25P.ts F25P-25P-d-25P-F25P-s-F25P-25P-d-25P-F25P.ts 1800
+
+fi
+
+#-----------
+# 25P-25P
+#-----------
+Connect ${H25P} ${F25P} 25P-F25P.ts 3600
+Connect 25P-F25P.ts ${H25P} 25P-F25P-25P.ts 3600
+Connect 25P-F25P-25P.ts 25P-F25P-25P.ts 25P-F25P-25P-s-25P-F25P-25P.ts 1800
+Connect 25P-F25P-25P-s-25P-F25P-25P.ts 25P-F25P-25P.ts 25P-F25P-25P-s-25P-F25P-25P-s-25P-F25P-25P.ts 1800

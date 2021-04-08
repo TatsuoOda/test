@@ -1,0 +1,661 @@
+
+/*
+	spes.cpp
+		2011.11.7	-R option : output SPES (out.bin)
+		2012.1.11	-M option : MODE_MERGE
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>	// memcpy
+
+#define MAX_BUF 1024*1024
+
+#define MODE_READ	0
+#define MODE_EDIT	1
+#define MODE_DTS_EDIT	2
+#define MODE_MERGE	3
+
+#define CODEC_NONE	0
+#define	CODEC_AVC	1
+#define CODEC_VC1	2
+#define CODEC_MP4	3
+
+#define OUT_ES		0
+#define OUT_SPES	1
+
+// ------------------------------------
+
+#define MAX_FRAMES 1024*1024
+int frames[MAX_FRAMES];
+int outMode = OUT_ES;
+int bNoPTS = 0;
+int bDetail=0;
+int nSeek=0;
+
+int nSPES=0;
+unsigned long SPES[MAX_FRAMES*4];
+
+// ------------------------------------
+
+int SpesParse( char *filename, char *diffFile, int mode, int fileID )
+{
+FILE *fpA=NULL, *fpB=NULL;
+unsigned char bufA[MAX_BUF];
+unsigned char bufB[MAX_BUF];
+int bEOF=0;
+int readed;
+int nError=0;
+int bHead=1;
+int bVC1=0;
+int bAVC=0;
+int maxSpesSize=0;
+int nInvalid=0;
+int editDTS=0;
+int i;
+unsigned long NextSPES[4];
+
+	fpA = fopen( filename, "rb" );
+	if( fpA==NULL )
+	{
+	    fprintf( stdout, "Can't open [%s]\n", filename );
+	    exit( 1 );
+	}
+	if( diffFile!=NULL )
+	{
+	    fpB = fopen( diffFile, "rb" );
+	    if( fpB==NULL )
+	    {
+		fprintf( stdout, "Can't open [%s]\n", diffFile );
+		exit( 1 );
+	    }
+	}
+	FILE *fout = fopen( "out.bin", "wb" );
+	if( fout==NULL )
+	{
+	    fprintf( stdout, "Can't open out.bin\n" );
+	}
+	FILE *fedit = NULL;
+
+	if( (mode==MODE_EDIT) || (mode==MODE_DTS_EDIT) )
+	{
+	    fedit = fopen( "edit.bin", "wb" );
+	}
+
+	int bAudio = 0;
+	unsigned int SPES_Size;
+	int NAL_Size;
+	int code;
+	int code2=0;
+	int total=0;
+	int nPES=1;
+	int headSize=0;
+	if( nSeek>0 )
+	{
+	    fseek( fpA, nSeek, SEEK_SET );
+	    total = nSeek;
+	}
+	while( bEOF==0 )
+	{
+	    int bNG=0;
+	    int bPTS=0;
+	    int bDTS=0;
+	    int PTS32=0;
+	    int DTS32=0;
+	    int PTS32_B=0;
+	    int DTS32_B=0;
+	    unsigned long PTS=0;
+	    unsigned long DTS=0;
+	    unsigned long PTS_B=0;
+	    unsigned long DTS_B=0;
+	    int bValid=0;
+	    readed = fread( bufA, 14, 1, fpA );
+	    if( readed<1 )
+	    {
+		    fprintf( stdout, "Can't read (1)@%X\n", total );
+		    bEOF=1;
+		    break;
+	    }
+	    if( fpB )
+	    {
+		readed = fread( bufB, 14, 1, fpB );
+		if( readed<1 )
+		{
+			fprintf( stdout, "Can't read fpB\n" );
+		}
+	    }
+#if 0
+	    if( bAudio || 
+	    ((bufA[0]==0x00) && (bufA[1]==0x00) && (bufA[2]==0x01)) )
+	    {	// Audio
+	    	if( bAudio==0 )
+		{
+		    fprintf( stdout, "Audio SPES\n" );
+		    bAudio=1;
+		}
+		int prefix = (bufA[0]<<16)
+			   | (bufA[1]<< 8)
+			   | (bufA[2]<< 0);
+		int id = bufA[3];
+		SPES_Size = (bufA[6]<<24)
+			  | (bufA[7]<<16)
+			  | (bufA[4]<< 8)
+			  | (bufA[5]<< 0);
+		int PES_HEADER_len = bufA[8];
+		headSize = 14;
+		total += headSize;
+		int body = SPES_Size-6;
+		readed = fread( &bufA[headSize], body, 1, fpA );
+		total += body;
+		bPTS  = (bufA[ 9]>>4);
+		PTS32 = (bufA[10]<<24)
+		      |	(bufA[11]<<16)
+		      |	(bufA[12]<< 8)
+		      |	(bufA[13]<< 0);
+
+		PTS = ((PTS32 & 0x00007FFF)<< 0)
+		    | ((PTS32 & 0xFFFF0000)<<15);
+
+		fprintf( stdout, "%5d :A=%7X:S=%5X:%06X:%2X ",
+		    nPES, total-SPES_Size, SPES_Size, prefix, id );
+		fprintf( stdout, "\n" );
+	    } else 
+#endif
+	    {	// Video
+	    	fread( &bufA[14], 2, 1, fpA );
+		if( fpB )
+	    	fread( &bufB[14], 2, 1, fpB );
+		SPES_Size = (bufA[0]<<24)
+			  | (bufA[1]<<16)
+			  | (bufA[2]<< 8)
+			  | (bufA[3]<< 0);
+		code = bufA[4];
+		if( code==0x30 )		// H.264
+		{
+		    readed = fread( &bufA[16], 4, 1, fpA );
+		    if( readed<1 )
+		    {
+			fprintf( stdout, "Can't read (2)@%X\n", total+16 );
+			bEOF=1;
+			break;
+		    }
+		    if( fpB )
+		    readed = fread( &bufB[16], 4, 1, fpB );
+		    NAL_Size = (bufA[16]<<24)
+			     | (bufA[17]<<16)
+			     | (bufA[18]<< 8)
+			     | (bufA[19]<< 0);
+		    headSize=20;
+		    bValid=1;
+		 } else if( code==0x31 )	// SPS
+		 {
+		    headSize=16;
+		    bAVC=1;
+		    bValid=1;
+		 } else if( code==0x32 )	// PPS
+		 {
+		    headSize=16;
+		    bAVC=1;
+		    bValid=1;
+		 } else if( code==0x41 )	// VC1-Parameters
+		 {
+		    int type = bufA[5];
+		    if( type==0x01 )	// Parameters(Advanced Profile)
+		    {
+			headSize=16;
+			fprintf( stdout, "VC1(%02X)\n", type );
+		    } else if( type==0x00 )// Parameters(Simple/Main Profile)
+		    {
+			headSize=16;
+			fprintf( stdout, "VC1(%02X)\n", type );
+		    } else {
+			fprintf( stdout, "Invalid VC1 type(%02X)\n", type );
+			exit( 1 );
+		    }
+		    bVC1 = 1;
+		    bValid=1;
+		 } else if( code==0x40 )	// VC1-FrameData
+		 {
+		    headSize=16;
+		    bValid=1;
+		 } else if( code==0x50 )	// DivX
+		 {
+		    readed = fread( &bufA[16], 8, 1, fpA );
+		    if( readed<1 )
+		    {
+			fprintf( stdout, "Can't read (2)@%X\n", total+16 );
+			bEOF=1;
+			break;
+		    }
+		    int Width, Height;
+		    Width    = (bufA[16]<<24)
+			     | (bufA[17]<<16)
+			     | (bufA[18]<< 8)
+			     | (bufA[19]<< 0);
+		    Height   = (bufA[16]<<24)
+			     | (bufA[17]<<16)
+			     | (bufA[18]<< 8)
+			     | (bufA[19]<< 0);
+		    if( (Width!=0) || (Height!=0) )
+			fprintf( stdout, "Width=%4d, Height=%4d\n",
+			    Width, Height );
+		    code2 = bufA[6]>>4;
+		    headSize=16+8;
+		    bValid=1;
+		 } else {	// Invaild
+		    fprintf( stdout, "Invalid code(%02X)@%X\n", code, total );
+		    nInvalid ++;
+		    if( bHead )
+		    {
+			int nSkip=0;
+			while( 1 )
+			{
+			    memcpy( &bufA[0], &bufA[1], 15 );
+			    readed = fread( &bufA[15], 1, 1, fpA );
+			    nSkip++;
+			    total++;
+			    if( readed<1 )
+			    {
+				fprintf( stdout, "EOF!!\n" );
+				exit( 1 );
+			    }
+			    SPES_Size = (bufA[0]<<24)
+				      | (bufA[1]<<16)
+				      | (bufA[2]<< 8)
+				      | (bufA[3]<< 0);
+			    code = bufA[4];
+
+			    if( (SPES_Size<0x1000)
+			    && ((code==0x40) || (code==0x41)) )
+			    {
+				fprintf( stdout, "nSkip=%d\n", nSkip );
+				headSize=16;
+				fprintf( stdout, 
+				"%02X %02X %02X %02X : %02X\n",
+				bufA[0], bufA[1], bufA[2], bufA[3], bufA[4] );
+				break;
+			    }
+			}
+		    } else {
+			SPES[nSPES*4+2] = 0;		// invalid
+			SPES[nSPES*4+3] = 0xFFFFFFFF;	// invalid
+#if 1
+		    	if( bVC1 )
+			{
+			    int nSkip=0;
+			    while( 1 )
+			    {
+				memcpy( &bufA[0], &bufA[1], 15 );
+				readed = fread( &bufA[15], 1, 1, fpA );
+				nSkip++;
+				total++;
+				if( readed<1 )
+				{
+				    fprintf( stdout, "EOF!!\n" );
+				    exit( 1 );
+				}
+				SPES_Size = (bufA[0]<<24)
+					  | (bufA[1]<<16)
+					  | (bufA[2]<< 8)
+					  | (bufA[3]<< 0);
+				code = bufA[4];
+
+				if( (SPES_Size<0x1000)
+				&& ((code==0x40) || (code==0x41)) )
+				{
+				    fprintf( stdout, "nSkip=%d\n", nSkip );
+				    headSize=16;
+				    fprintf( stdout, 
+				    "%02X %02X %02X %02X : %02X\n",
+				    bufA[0], bufA[1], bufA[2], bufA[3], 
+				    bufA[4] );
+				    break;
+				}
+			    }
+			} else  {
+#endif
+			    if( bAVC )
+			    {
+				int nSkip=0;
+				while( 1 )
+				{
+				    memcpy( &bufA[0], &bufA[1], 15 );
+				    readed = fread( &bufA[15], 1, 1, fpA );
+				    nSkip++;
+				    total++;
+				    if( readed<1 )
+				    {
+					fprintf( stdout, "EOF!!\n" );
+					exit( 1 );
+				    }
+				    SPES_Size = (bufA[0]<<24)
+					      | (bufA[1]<<16)
+					      | (bufA[2]<< 8)
+					      | (bufA[3]<< 0);
+				    code = bufA[4];
+
+				    if( (SPES_Size<0x20000)
+				    && ((code==0x30) 
+				     || (code==0x31)
+				     || (code==0x32)) )
+				    {
+					fprintf( stdout, "nSkip=%d\n", nSkip );
+					headSize=16;
+					fprintf( stdout, 
+					"%02X %02X %02X %02X : %02X\n",
+					bufA[0], bufA[1], bufA[2], bufA[3], 
+					bufA[4] );
+					break;
+				    }
+				}
+			    } else
+			    {
+			fprintf( stdout, "maxSpesSize=0x%X\n", maxSpesSize );
+				exit( 1 );
+			    }
+			}
+		    }
+		}
+		// -------------
+		NextSPES[0] = fileID;
+		NextSPES[1] = total;
+		NextSPES[2] = SPES_Size;
+		// -------------
+		 bHead = 0;
+
+		 if( bNoPTS )
+		     bufA[ 5] = bufA[ 5] & 0x3F;	// PTS/DTS invalid
+		 total+=headSize;
+		 if( SPES_Size>MAX_BUF )
+		 {
+		    fprintf( stdout, "SPES_Size Too large (%X)@%X\n", 
+		    	SPES_Size, total );
+		    nInvalid++;
+		    SPES_Size =  0;
+		    bValid=0;
+//		    exit( 1 );
+		 } else {
+		     readed = fread( &bufA[headSize], 
+		     	SPES_Size-headSize, 1, fpA );
+		     if( readed<1 )
+		     {
+			fprintf( stdout, "Can't read (3) @%8X+%8X =%8X\n", 
+				total, SPES_Size-headSize,
+				total + SPES_Size-headSize);
+			bEOF = 1;
+			break;
+		     }
+		 }
+    #if 1
+    		int written=0;
+    		if( outMode==OUT_ES )
+		{
+		    // output ES only
+//		    fprintf( stdout, "headSize =%d\n", headSize );
+//		    fprintf( stdout, "SPES_Size=%d\n", SPES_Size );
+		    written = fwrite( &bufA[headSize], 
+		    	1, SPES_Size-headSize, fout );
+		} else if( outMode==OUT_SPES )
+		{
+		    written = fwrite( &bufA[0], 1, SPES_Size, fout );
+		}
+//		fprintf( stdout, "written=%d\n", written );
+    #endif
+		 if( fpB )
+		 {
+		     readed = fread( &bufB[headSize], 
+		     	SPES_Size-headSize, 1, fpB );
+		     for( i=headSize; i<SPES_Size; i++ )
+		     {
+			    if( bufA[i]!=bufB[i] )
+			    {
+				if( bDetail )
+				fprintf( stdout, "Diff(%8X) : %02X != %02X\n",
+				    total-headSize+i, bufA[i], bufB[i] );
+				nError++;
+				bNG++;
+				if( bDetail )
+				if( nError>100 )
+				{
+				    fprintf( stdout, "Too many Errors(%d)\n",
+					nError );
+				    exit( 1 );
+				}
+			    }
+		     }
+		 }
+		total+=(SPES_Size-headSize);
+		if( bValid )
+		{
+		    bPTS  = (bufA[ 5]&0x80) ? 1 : 0;
+		    bDTS  = (bufA[ 5]&0x40) ? 1 : 0;
+		    PTS32 = (bufA[ 5]&0x20) ? 1 : 0;
+		    DTS32 = (bufA[ 5]&0x10) ? 1 : 0;
+		    PTS   = (bufA[ 8]<<24)
+			  | (bufA[ 9]<<16)
+			  | (bufA[10]<< 8)
+			  | (bufA[11]<< 0);
+		    DTS   = (bufA[12]<<24)
+			  | (bufA[13]<<16)
+			  | (bufA[14]<< 8)
+			  | (bufA[15]<< 0);
+		    if( fpB )
+		    {
+		    PTS32_B = (bufB[ 5]&0x20) ? 1 : 0;
+		    DTS32_B = (bufB[ 5]&0x10) ? 1 : 0;
+		    PTS_B = (bufB[ 8]<<24)
+			  | (bufB[ 9]<<16)
+			  | (bufB[10]<< 8)
+			  | (bufB[11]<< 0);
+		    DTS_B = (bufB[12]<<24)
+			  | (bufB[13]<<16)
+			  | (bufB[14]<< 8)
+			  | (bufB[15]<< 0);
+		    }
+
+		    if( code==0x50 )	// DIVX
+			fprintf( stdout, "%5d :A=%7X:S=%5X:%02X:%1X ",
+			    nPES, total-SPES_Size, SPES_Size, code, code2 );
+		    else
+			fprintf( stdout, "%5d :A=%7X:S=%5X:%02X: ",
+			    nPES, total-SPES_Size, SPES_Size, code );
+		    if( bPTS )
+			fprintf( stdout, "%1X %08X,", PTS32, PTS );
+		    else
+			fprintf( stdout, "- --------," );
+		    if( bDTS )
+			fprintf( stdout, "%1X %08X", DTS32, DTS );
+		    else
+			fprintf( stdout, "- --------" );
+		    if( fpB )
+		    {
+		    fprintf( stdout, " | " );
+		    if( bPTS )
+			fprintf( stdout, "%1X %08X,", PTS32_B, PTS_B );
+		    else
+			fprintf( stdout, "- --------," );
+		    if( bDTS )
+			fprintf( stdout, "%1X %08X", DTS32_B, DTS_B );
+		    else
+			fprintf( stdout, "- --------" );
+		    }
+		    if( fpB )
+		    {
+			if( bNG==0 )
+			    fprintf( stdout, " O" );
+			else
+			    fprintf( stdout, " X" );
+		    }
+		    fprintf( stdout, "\n" );
+		    if( mode==MODE_EDIT )
+		    {
+			if( nPES<MAX_FRAMES )
+			if( frames[nPES]>0 )
+			    fwrite( bufA, 1, SPES_Size, fedit );
+		    } else if( mode==MODE_DTS_EDIT )
+		    {
+			if( code==0x40 )	// VC1-FrameData
+			{
+			    bufA[12] = (editDTS>>24)&0xFF;
+			    bufA[13] = (editDTS>>16)&0xFF;
+			    bufA[14] = (editDTS>> 8)&0xFF;
+			    bufA[15] = (editDTS>> 0)&0xFF;
+			    editDTS = editDTS+3000;
+			}
+			fwrite( bufA, 1, SPES_Size, fedit );
+		    }
+		    if( SPES_Size>maxSpesSize )
+			maxSpesSize = SPES_Size;
+		}
+	    }
+	    nPES++;
+	}
+	fclose( fpA );
+	if( fpB )
+	    fclose( fpB );
+	if( fout )
+	    fclose( fout );
+	if( fedit )
+	    fclose( fedit );
+	fprintf( stdout, "maxSpesSize=0x%X\n", maxSpesSize );
+	fprintf( stdout, "invalid=%d\n", nInvalid );
+}
+
+void Usage( char *prg )
+{
+	fprintf( stdout, "%s filename\n", prg );
+	exit( 1 );
+}
+
+#define MAX_FILE 16
+
+int main( int argc, char *argv[] )
+{
+char *filename[MAX_FILE];
+char *diffFile=NULL;
+int i;
+int args=0;
+int mode    = MODE_READ;
+int codec   = CODEC_NONE;
+// ------------------
+
+	for( i=0; i<MAX_FILE; i++ )
+	{
+	    filename[i] = NULL;
+	}
+
+	for( i=0; i<MAX_FRAMES; i++ )
+	{
+	    frames[i] = 0;
+	}
+	for( i=0; i<MAX_FRAMES*4; i++ )
+	{
+	    SPES[i] = 0;
+	}
+	for( i=1; i<argc; i++ )
+	{
+	    if( argv[i][0]=='+' )
+	    {
+	    	switch( argv[i][1] )
+		{
+		case 'E' :
+		    mode = MODE_EDIT;
+		    break;
+		case 'M' :
+		    mode = MODE_MERGE;
+		    break;
+		case 'T' :
+		    mode = MODE_DTS_EDIT;
+		    break;
+		case 'R' :
+		    outMode = OUT_SPES;
+		    break;
+		}
+	    } else if( argv[i][0]=='-' )
+	    {
+	    	switch( argv[i][1] )
+		{
+		case 'P' :
+		    bNoPTS = 1;
+		    break;
+		case 'A' :
+		    codec = CODEC_AVC;
+		    break;
+		case 'V' :
+		    bDetail=1;
+		    break;
+		case 'S' :
+		    nSeek = atoi( &argv[i][2] );
+		    fprintf( stdout, "nSeek=%d\n", nSeek );
+		    break;
+		}
+	    } else {
+	    	switch( args )
+		{
+		case 0 :
+		    filename[0] = argv[i];
+		    break;
+		case 1 :
+		default :
+		    if( mode==MODE_READ )
+		    {
+			diffFile = argv[i];
+		    } else if( mode==MODE_MERGE )
+		    {
+		    	if( args<MAX_FILE )
+			    filename[args] = argv[i];
+			else {
+			    fprintf( stdout, "Too many filename\n" );
+			    Usage( argv[0] );
+			}
+		    } else {
+			int j;
+			int from=0, to=0;
+			int phase=0;
+		    	for( j=0; j<strlen(argv[i]); j++ )
+			{
+			    if( (argv[i][j]>='0') && (argv[i][j]<='9') )
+			    {
+			    	if( phase==0 )
+				    from=from*10+argv[i][j]-'0';
+				else
+				    to  =to  *10+argv[i][j]-'0';
+			    } else if( argv[i][j]=='-' )
+			    {
+			    	phase++;
+			    } else {
+			    	break;
+			    }
+			}
+			if( from>0 )
+			{
+			    if( to>from )
+			    {
+			    	for( j=from; j<=to; j++ )
+				{
+				    frames[j]=1;
+				}
+			    } else
+			    	frames[from]=1;
+			}
+		    }
+		    break;
+		}
+	    	args++;
+	    }
+	}
+	if( filename[0]==NULL )
+	{
+	    Usage( argv[0] );
+	}
+	if( mode==MODE_MERGE )
+	{
+	    for( i=0; i<args; i++ )
+	    {
+		SpesParse( filename[0], NULL, mode, i );
+	    }
+	} else {
+	    SpesParse( filename[0], diffFile, mode, 0 );
+	}
+}
+

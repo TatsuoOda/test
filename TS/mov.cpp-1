@@ -1,0 +1,826 @@
+
+/*
+	mov.cpp
+		2012.1.6  by T.Oda
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int bDebug=0;
+
+unsigned long g_addr=0;
+
+void EXIT( )
+{
+	fprintf( stdout, "EXITing(0x%X)\n", g_addr );
+	exit( 1 );
+}
+
+int gread( unsigned char *buffer, int size1, int size2, FILE *fp )
+{
+int readed = fread( buffer, size1, size2, fp );
+	if( readed<size2 )
+	{
+	    fprintf( stdout, "readed(%d/%d)\n", readed, size2 );
+	    fprintf( stdout, "EOF(0x%X)\n", g_addr );
+	}
+	g_addr += readed*size1;
+	return readed;
+}
+
+int Gread( unsigned char *buffer, int size1, int size2, FILE *fp,
+	int *pTotal1, int *pTotal2)
+{
+	int readed = gread( buffer, size1, size2, fp );
+	if( readed<size2 )
+	    EXIT( );
+	if( pTotal1 )
+	    *pTotal1 = *pTotal1 + size1*size2;
+	if( pTotal2 )
+	    *pTotal2 = *pTotal2 + size1*size2;
+	return readed;
+}
+
+unsigned long Short( unsigned char *buffer )
+{
+unsigned short size=0;
+	size = (buffer[0]<< 8)
+	     | (buffer[1]<< 0);
+	return size;
+}
+unsigned long Long( unsigned char *buffer )
+{
+unsigned long size=0;
+	size = (buffer[0]<<24)
+	     | (buffer[1]<<16)
+	     | (buffer[2]<< 8)
+	     | (buffer[3]<< 0);
+	return size;
+}
+
+// ---------------------------------------------
+#define BUF_SIZE 1024*1024
+unsigned char buf[BUF_SIZE];
+
+void Level( int level )
+{
+int i;
+	for( i=0; i<level; i++ )
+	{
+	    fprintf( stdout, "+" );
+	}
+}
+
+int skip( FILE *fp, int size )
+{
+int total=0;
+int readed;
+
+	while( total<size )
+	{
+	    int sz = size-total;
+	    if( sz>BUF_SIZE )
+	    	sz = BUF_SIZE;
+	    readed = gread( buf, 1, sz, fp );
+	    if( readed<1 )
+	    	EXIT();
+	    total+=readed;
+	}
+	
+	return total;
+}
+
+int SkipAtom( char *title, FILE *fp, int size, int level )
+{
+	Level( level );
+	fprintf( stdout, "%8X : [%s] size=%8X\n", g_addr-8, title, size );
+	return skip( fp, size-8 );
+}
+
+int mdat( FILE *fp, int size )
+{
+	fprintf( stdout, "[mdat]@0x%X size=%8X\n", g_addr-8, size );
+	skip( fp, size );
+
+	return 0;
+}
+
+int mvhd( FILE *fp, int size )
+{
+	fprintf( stdout, "[mvhd]@0x%X size=%8X\n", g_addr-8, size );
+	skip( fp, size );
+
+	return 0;
+}
+
+int tkhd( FILE *fp, int size )
+{
+	fprintf( stdout, "[tkhd]@0x%X size=%8X\n", g_addr-8, size );
+	skip( fp, size );
+
+	return 0;
+}
+
+int hdlr( FILE *fp, int size )
+{
+int total=0;
+int readed;
+	fprintf( stdout, "[hdlr]@0x%X\n", g_addr-8 );
+	fprintf( stdout, "=======================\n" );
+	memset( buf, 0, 8 );
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	fprintf( stdout, "Component type         = [%s]\n", buf );
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	fprintf( stdout, "Component subtype      = [%s]\n", buf );
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	fprintf( stdout, "Component manufacturer = [%s]\n", buf );
+	skip( fp, size-total );
+	fprintf( stdout, "=======================\n" );
+	return 0;
+}
+
+int stsd( FILE *fp, int size )
+{
+int total=0;
+int readed;
+	fprintf( stdout, "[stsd(0x%X)]@0x%X\n", size, g_addr-8 );
+	fprintf( stdout, "=======================\n" );
+
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	fprintf( stdout, "Version= %02X\n", buf[0] );
+	fprintf( stdout, "Flags  = %02X %02X %02X\n", 
+		buf[1], buf[2], buf[3] );
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+
+	int entries = Long(buf);
+	fprintf( stdout, "Number of entries      = %d\n", entries );
+
+	int e;
+	for( e=0; e<entries; e++ )
+	{
+	// Sample descripiton size
+	    int sz;
+	    int e_total=4;
+	    readed = Gread( buf, 1, 4, fp, &total, &e_total );
+	    sz = Long( buf );
+	    fprintf( stdout, "sz=0x%X\n", sz );
+	// Data format
+	    readed = Gread( buf, 1, 4, fp, &total, &e_total );
+	    fprintf( stdout, "Data format            = [%s] : ", buf );
+	    int bVideo=0;
+	    int bAudio=0;
+	    if( strncmp( (char *)buf, "jpeg", 4 )==0 )
+	    {
+	    	fprintf( stdout, "JPEG\n" );
+	    	bVideo=1;
+	    } else if( strncmp( (char *)buf, "rle ", 4 )==0 )
+	    {
+	    	fprintf( stdout, "Animation\n" );
+	    	bVideo=1;
+	    } else if( strncmp( (char *)buf, "png ", 4 )==0 )
+	    {
+	    	fprintf( stdout, "Portable Network Graphics\n" );
+	    	bVideo=1;
+	    } else if( strncmp( (char *)buf, "mjpa", 4 )==0 )
+	    {
+	    	fprintf( stdout, "Motion-JPEG(format A)\n" );
+	    	bVideo=1;
+	    } else if( strncmp( (char *)buf, "mjpb", 4 )==0 )
+	    {
+	    	fprintf( stdout, "Motion-JPEG(format B)\n" );
+	    	bVideo=1;
+	    } else if( strncmp( (char *)buf, "SVQ1", 4 )==0 )
+	    {
+	    	fprintf( stdout, "Sorenson video 1\n" );
+	    	bVideo=1;
+	    } else if( strncmp( (char *)buf, "SVQ3", 4 )==0 )
+	    {
+	    	fprintf( stdout, "Sorenson video 3\n" );
+	    	bVideo=1;
+	    } else if( strncmp( (char *)buf, "mp4v", 4 )==0 )
+	    {
+	    	fprintf( stdout, "MPEG-4 video\n" );
+	    	bVideo=1;
+	    } else if( strncmp( (char *)buf, "avc1", 4 )==0 )
+	    {
+	    	fprintf( stdout, "H.264 video\n" );
+	    	bVideo=1;
+	    } else if( strncmp( (char *)buf, "dvc ", 4 )==0 )
+	    {
+	    	fprintf( stdout, "NTSC DV-25 video\n" );
+	    	bVideo=1;
+	    } else if( strncmp( (char *)buf, "dvcp", 4 )==0 )
+	    {
+	    	fprintf( stdout, "PAL  DV-25 video\n" );
+	    	bVideo=1;
+	// ---------------------------------------------
+	    } else if( strncmp( (char *)buf, "raw ", 4 )==0 )
+	    {
+	    	fprintf( stdout, "Uncompressed 8bit audio\n" );
+	    	bAudio=1;
+	    } else if( strncmp( (char *)buf, "twos", 4 )==0 )
+	    {
+	    	fprintf( stdout, "16bit big-endian audio\n" );
+	    	bAudio=1;
+	    } else if( strncmp( (char *)buf, "sowt", 4 )==0 )
+	    {
+	    	fprintf( stdout, "16bit little-endian audio\n" );
+	    	bAudio=1;
+	    } else if( strncmp( (char *)buf, "ulaw", 4 )==0 )
+	    {
+	    	fprintf( stdout, "uLaw 2:1 audio\n" );
+	    	bAudio=1;
+	    } else if( strncmp( (char *)buf, "alaw", 4 )==0 )
+	    {
+	    	fprintf( stdout, "aLaw 2:1 audio\n" );
+	    	bAudio=1;
+	    } else if( strncmp( (char *)buf, "dvca", 4 )==0 )
+	    {
+	    	fprintf( stdout, "DV Audio\n" );
+	    	bAudio=1;
+	    } else if( strncmp( (char *)buf, ".mp3", 4 )==0 )
+	    {
+	    	fprintf( stdout, "MPEG-1 layer 3 Audio\n" );
+	    	bAudio=1;
+	    } else if( strncmp( (char *)buf, "mp4a", 4 )==0 )
+	    {
+	    	fprintf( stdout, "MPEG-4 AAC Audio\n" );
+	    	bAudio=1;
+	    } else if( strncmp( (char *)buf, "ac-3", 4 )==0 )
+	    {
+	fprintf( stdout, "Digital Audio Compression Standard(AC-3) Audio\n" );
+	    	bAudio=1;
+	    } else {
+	    	fprintf( stdout, "Unknown format\n" );
+		EXIT();
+	    }
+	// Reserved
+	    readed = Gread( buf, 1, 6, fp, &total, &e_total );
+	// Data reference index
+	    readed = Gread( buf, 1, 2, fp, &total, &e_total );
+	    int index= Short( buf );
+	    fprintf( stdout, "Data reference index   = %d\n", index );
+
+	    if( bVideo )
+	    {
+	    // Version (16)
+		readed = Gread( buf, 1, 2, fp, &total, &e_total );
+		int Version=Short(buf);
+	    // Revision level (16)
+		readed = Gread( buf, 1, 2, fp, &total, &e_total );
+	    // Vendor (32)
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+		buf[4] = 0;
+	    if( buf[0]>=' ' )
+		fprintf( stdout, "Verndor                = [%s]\n", buf );
+	    else
+	    fprintf( stdout, "Verndor                = %02X %02X %02X %02X\n",
+	    	buf[0], buf[1], buf[2], buf[3] );
+	    // Temporal quality (32)
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+	    // Spatial quality (32)
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+	    // Width (16)
+		readed = Gread( buf, 1, 2, fp, &total, &e_total );
+		int width = Short( buf );
+		fprintf( stdout, "Width                  = %4d\n", width );
+	    // Height (16)
+		readed = Gread( buf, 1, 2, fp, &total, &e_total );
+		int height = Short( buf );
+		fprintf( stdout, "Height                 = %4d\n", height );
+	    // Horizontal resolution (32)
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+		int h_res = Long( buf );
+		fprintf( stdout, "Horizontal resolution  = 0x%X\n", h_res );
+	    // Vertial resoltion (32)
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+		int v_res = Long( buf );
+		fprintf( stdout, "Vertical   resolution  = 0x%X\n", v_res );
+	    // Data size (32)
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+		int dataSize = Long( buf );
+		fprintf( stdout, "Data size              = %4d\n", dataSize );
+	    // Frame count (16)
+		readed = Gread( buf, 1, 2, fp, &total, &e_total );
+		int frameCount = Short( buf );
+		fprintf( stdout, "Frame count            = %4d\n", frameCount);
+	    // Compressor name (32byte)
+		readed = Gread( buf, 1, 32, fp, &total, &e_total );
+		buf[32] = 0;
+		fprintf( stdout, "Compressor name        = " );
+		if( buf[0]==0 )
+		    fprintf( stdout, "NULL\n" );
+		else {
+#if 1
+		    fprintf( stdout, "[%s]\n", &buf[1] );
+#else
+		    int ii;
+		    fprintf( stdout, "[" );
+		    for( ii=0; (ii<buf[0]) && (ii<32); ii++ )
+		    {
+		    	if( buf[ii+1]<0x7E )
+			fprintf( stdout, "%c", buf[ii+1] );
+			else
+			fprintf( stdout, "(%02X)", buf[ii+1] );
+		    }
+		    fprintf( stdout, "]\n" );
+#endif
+		}
+	    // Depth (16)
+		readed = Gread( buf, 1, 2, fp, &total, &e_total );
+		int depth = Short( buf );
+		fprintf( stdout, "Depth                  = %2d\n", depth );
+	    // Color table ID (16)
+		readed = Gread( buf, 1, 2, fp, &total, &e_total );
+		int ctable = Short( buf );
+		fprintf( stdout, "Color table ID         = %4d\n", ctable );
+
+		while( sz>e_total )
+		{
+		fprintf( stdout, "size=%d, e_total=%d\n", sz, e_total );
+	    // Size
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+	    	int e_size = Long( buf );
+		fprintf( stdout, "Extension size         = 0x%X\n", e_size );
+	    // Type
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+		buf[4] = 0;
+		fprintf( stdout, "Extension type         = [%s]\n", buf );
+	    //
+	    	int ii;
+	    	for( ii=8; ii<e_size; ii++ )
+		{
+		    readed = Gread( buf, 1, 1, fp, &total, &e_total );
+		    fprintf( stdout, "%02X ", buf[0] );
+		    if( ((ii-8)%16)==15)
+			fprintf( stdout, "\n" );
+		}
+		if( ((ii-8)%16)!=0)
+		    fprintf( stdout, "\n" );
+		}
+		fprintf( stdout, "size=%d, e_total=%d\n", sz, e_total );
+	    }
+	    if( bAudio )
+	    {
+	    // Version (16)
+		readed = Gread( buf, 1, 2, fp, &total, &e_total );
+	    	int Version = Short( buf );
+		fprintf( stdout, "Version                = %d\n", Version );
+	    // Revision (16)
+		readed = Gread( buf, 1, 2, fp, &total, &e_total );
+	    	int Revision = Short( buf );
+		fprintf( stdout, "Revision               = %d\n", Revision );
+	    // Vendor (32)
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+	    	int Vendor = Long( buf );
+		fprintf( stdout, "Vendor                 = %8X ", Vendor );
+		if( (buf[0]>' ') && (buf[0]<0x7F) )
+		{
+		    buf[4] = 0;
+		    fprintf( stdout, "[%s]\n", buf );
+		} else
+		    fprintf( stdout, "\n" );
+	    // Number of channels (16)
+		readed = Gread( buf, 1, 2, fp, &total, &e_total );
+	    	int channels = Short( buf );
+		fprintf( stdout, "Number of channels     = %d\n", channels );
+	    // Sample size (16)
+		readed = Gread( buf, 1, 2, fp, &total, &e_total );
+	    	int SampleSize = Short( buf );
+		fprintf( stdout, "Sample Size            = %d\n", SampleSize );
+	    // Compression ID (16)
+		readed = Gread( buf, 1, 2, fp, &total, &e_total );
+	    	int CompressionID = Short( buf );
+	    fprintf( stdout, "Compression ID         = %d\n", CompressionID );
+	    // Packet size (16)
+		readed = Gread( buf, 1, 2, fp, &total, &e_total );
+	    	int PacketSize = Short( buf );
+		fprintf( stdout, "PcketSize              = %d\n", PacketSize );
+	    // Sample rate(32)
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+	    	int SampleRateH = Short( &buf[0] );
+	    	int SampleRateL = Short( &buf[2] );
+	    fprintf( stdout, "SampleRate             = %d.%03d\n", 
+	    	SampleRateH, SampleRateL );
+
+		if( Version==1 )
+		{
+	    // Samples per packet (32)
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+	    	int SamplesPerPacket = Long( buf );
+	    fprintf( stdout, "Samples per packet     = %d\n", SamplesPerPacket);
+	    // Bytes per packet (32)
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+	    	int BytesPerPacket = Long( buf );
+	    fprintf( stdout, "Bytes   per packet     = %d\n", BytesPerPacket );
+	    // Bytes per frame (32)
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+	    	int BytesPerFrame = Long( buf );
+	    fprintf( stdout, "Bytes   per frame      = %d\n", BytesPerFrame );
+	    // Bytes per sample (32)
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+	    int BytesPerSample = Long( buf );
+	    fprintf( stdout, "Bytes   per sample     = %d\n", BytesPerSample );
+		}
+		while( sz>e_total )
+		{
+		fprintf( stdout, "size=%d, e_total=%d\n", sz, e_total );
+	    // Size
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+	    	int e_size = Long( buf );
+		fprintf( stdout, "Extension size         = 0x%X\n", e_size );
+	    // Type
+		readed = Gread( buf, 1, 4, fp, &total, &e_total );
+		buf[4] = 0;
+		fprintf( stdout, "Extension type         = [%s]\n", buf );
+	    	int ii;
+	    	for( ii=8; ii<e_size; ii++ )
+		{
+		    readed = Gread( buf, 1, 1, fp, &total, &e_total );
+		    fprintf( stdout, "%02X ", buf[0] );
+		    if( ((ii-8)%16)==15)
+			fprintf( stdout, "\n" );
+		}
+		if( ((ii-8)%16)!=0)
+		    fprintf( stdout, "\n" );
+		fprintf( stdout, "size=%d, e_total=%d\n", sz, e_total );
+		fprintf( stdout, "-----------------------\n" );
+		}
+	    }
+
+	    total+=skip( fp, sz-e_total );
+	}
+	fprintf( stdout, "size=%d, total=%d\n", size, total );
+
+	skip( fp, size-total );
+	fprintf( stdout, "=======================\n" );
+	return 0;
+}
+
+int mdhd( FILE *fp, int size )
+{
+int readed;
+int total=0;
+
+	fprintf( stdout, "[mdhd]@0x%X size=%8X\n", g_addr-8, size );
+	fprintf( stdout, "=======================\n" );
+
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	fprintf( stdout, "Version= %02X\n", buf[0] );
+	fprintf( stdout, "Flags  = %02X %02X %02X\n", buf[1], buf[2], buf[3] );
+
+    // Creation time (32)
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	int CreationTime = Long(buf);
+	fprintf( stdout, "Creation time          = 0x%X\n", CreationTime );
+    // Modification time (32)
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	int ModificationTime = Long(buf);
+	fprintf( stdout, "Modification time      = 0x%X\n", ModificationTime );
+    // Time scale (32)
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	int TimeScale = Long(buf);
+	fprintf( stdout, "Time scale             = %d fps\n", TimeScale );
+    // Duration (32)
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	int Duration = Long(buf);
+	fprintf( stdout, "Duration               = %d\n", Duration );
+    // Language (16)
+	readed = Gread( buf, 1, 2, fp, &total, NULL );
+	int Language = Short(buf);
+	fprintf( stdout, "Language               = 0x%X\n", Language );
+    // Quality (16)
+	readed = Gread( buf, 1, 2, fp, &total, NULL );
+	int Quality = Short(buf);
+	fprintf( stdout, "Quality                = 0x%X\n", Quality );
+	fprintf( stdout, "=======================\n" );
+
+	return 0;
+}
+
+int stsz( FILE *fp, int size )
+{
+int total=0;
+int readed;
+	fprintf( stdout, "=======================\n" );
+	fprintf( stdout, "[stsz(0x%X)]@0x%X\n", size, g_addr-8 );
+
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	fprintf( stdout, "Version= %02X\n", buf[0] );
+	fprintf( stdout, "Flags  = %02X %02X %02X\n", 
+		buf[1], buf[2], buf[3] );
+
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	int SampleSize = Long(buf);
+	fprintf( stdout, "Sample size            = %d\n", SampleSize );
+
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	int entries = Long(buf);
+	fprintf( stdout, "Number of entries      = %d\n", entries );
+
+	int e;
+	for( e=0; e<entries; e++ )
+	{
+	    readed = Gread( buf, 1, 4, fp, &total, NULL );
+	    int offset = Long( buf );
+	}
+	fprintf( stdout, "size=%d, total=%d\n", size, total );
+
+	skip( fp, size-total );
+	fprintf( stdout, "=======================\n" );
+	return 0;
+}
+
+int stco( FILE *fp, int size )
+{
+int total=0;
+int readed;
+	fprintf( stdout, "=======================\n" );
+	fprintf( stdout, "[stco(0x%X)]@0x%X\n", size, g_addr-8 );
+
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	fprintf( stdout, "Version= %02X\n", buf[0] );
+	fprintf( stdout, "Flags  = %02X %02X %02X\n", 
+		buf[1], buf[2], buf[3] );
+
+	readed = Gread( buf, 1, 4, fp, &total, NULL );
+	int entries = Long(buf);
+	fprintf( stdout, "Number of entries      = %d\n", entries );
+
+	int e;
+	for( e=0; e<entries; e++ )
+	{
+	    readed = Gread( buf, 1, 4, fp, &total, NULL );
+	    int offset = Long( buf );
+	}
+	fprintf( stdout, "size=%d, total=%d\n", size, total );
+
+	skip( fp, size-total );
+	fprintf( stdout, "=======================\n" );
+	return 0;
+}
+
+
+int moov( FILE *fp, int size )
+{
+int readed;
+int sz;
+	fprintf( stdout, "[moov]@0x%X\n", g_addr );
+	while( 1 )
+	{
+	    int bNoSkip=0;
+	    memset( buf, 0, 1024 );
+	    readed = gread( buf, 1, 4, fp );
+	    if( readed<4 )
+	    	EXIT();
+	    sz = Long( buf );
+	    readed = gread( buf, 1, 4, fp );
+	    if( readed<4 )
+	    	EXIT();
+	    if( (buf[0]>=0x80) || (buf[1]>=0x80) 
+	     || (buf[2]>=0x80) || (buf[3]>=0x80) )
+	    {
+	    	fprintf( stdout, "%8X : NoAtom[%s]\n",
+			g_addr-8, buf );
+		EXIT();
+	    }
+	    fprintf( stdout, "%8X : [%s] size=%8X\n", g_addr-8, buf, sz );
+	    if( strncmp( (char *)buf, "trak", 4 )==0 )
+	    	bNoSkip=1;
+	    else if( strncmp( (char *)buf, "mdia", 4 )==0 )
+	    	bNoSkip=1;
+	    else if( strncmp( (char *)buf, "hdlr", 4 )==0 )
+	    {
+	    	hdlr( fp, sz-8 );
+	    	bNoSkip=1;
+	    } else if( strncmp( (char *)buf, "minf", 4 )==0 )
+	    	bNoSkip=1;
+	    else if( strncmp( (char *)buf, "dinf", 4 )==0 )
+	    	bNoSkip=1;
+	    else if( strncmp( (char *)buf, "stbl", 4 )==0 )
+	    {
+	    	bNoSkip=1;
+	    } else if( strncmp( (char *)buf, "stsd", 4 )==0 )
+	    {	// Sample Description Atoms
+	    	stsd( fp, sz-8 );
+	    	bNoSkip=1;
+	    }
+	    if( bNoSkip==0 )
+		skip( fp, sz-8 );
+	}
+
+	return 0;
+}
+
+int header( char *name, int size, int level )
+{
+	Level( level );
+	fprintf( stdout, "(%s)@0x%X size=%8X\n", name, g_addr-8, size );
+}
+
+int ParseMOV( FILE *fp, unsigned long Size, int level )
+{
+unsigned char buffer[1024*1024];
+int size;
+int readed;
+
+unsigned long start = g_addr-8;
+
+	level++;
+	while( 1 )
+	{
+//	    fprintf( stdout, "Parse(%8X/%8X)\n", g_addr-start, Size );
+	    memset( buffer, 0, 1024 );
+	    readed = gread( buffer, 1, 4, fp );
+	    if( readed<4 )
+	    	EXIT();
+	    size = Long( buffer );
+	    readed = gread( buffer, 1, 4, fp );
+	    if( readed<4 )
+	    	EXIT();
+	    if( strncmp( (char *)buffer, "ftyp", 4 )==0 )
+	    {
+	    	SkipAtom( "ftyp", fp, size, level );
+	    } else if( strncmp( (char *)buffer, "mdat", 4 )==0 )
+	    {
+		mdat( fp, size-8 );
+	    } else if( strncmp( (char *)buffer, "moov", 4 )==0 )
+	    {
+	    	header( "moov", size, level );
+		ParseMOV( fp, size, level );
+//	    	moov( fp, size-8 );
+	    } else if( strncmp( (char *)buffer, "wide", 4 )==0 )
+	    {
+	    	header( "wide", size, level );
+	    } else if( strncmp( (char *)buffer, "free", 4 )==0 ) // MP4
+	    {
+	    	header( "free", size, level );
+	    } else if( strncmp( (char *)buffer, "mvhd", 4 )==0 ) // 
+	    {
+		Level( level );
+		mvhd( fp, size-8 );
+	    } else if( strncmp( (char *)buffer, "trak", 4 )==0 ) // 
+	    {
+	    	header( "trak", size, level );
+	    	ParseMOV( fp, size, level );
+	    } else if( strncmp( (char *)buffer, "tkhd", 4 )==0 ) // 
+	    {
+		Level( level );
+		tkhd( fp, size-8 );
+	    } else if( strncmp( (char *)buffer, "edts", 4 )==0 ) // 
+	    {
+	    	header( "edts", size, level );
+	    } else if( strncmp( (char *)buffer, "elst", 4 )==0 ) // 
+	    {
+	    	SkipAtom( "elst", fp, size, level );
+	    } else if( strncmp( (char *)buffer, "mdia", 4 )==0 ) // 
+	    {
+	    	header( "mdia", size, level );
+	    	ParseMOV( fp, size, level );
+	    } else if( strncmp( (char *)buffer, "mdhd", 4 )==0 ) // 
+	    {
+//	    	SkipAtom( "mdhd", fp, size, level );
+		Level( level );
+		mdhd( fp, size-8 );
+	    } else if( strncmp( (char *)buffer, "hdlr", 4 )==0 ) // 
+	    {
+		Level( level );
+		hdlr( fp, size-8 );
+	    } else if( strncmp( (char *)buffer, "minf", 4 )==0 ) // 
+	    {
+	    	header( "minf", size, level );
+		ParseMOV( fp, size, level );
+	    } else if( strncmp( (char *)buffer, "vmhd", 4 )==0 ) // 
+	    {
+	    	SkipAtom( "vmhd", fp, size, level );
+	    } else if( strncmp( (char *)buffer, "dinf", 4 )==0 ) // 
+	    {
+	    	header( "dinf", size, level );
+	    } else if( strncmp( (char *)buffer, "dref", 4 )==0 ) // 
+	    {
+	    	SkipAtom( "dref", fp, size, level );
+	    } else if( strncmp( (char *)buffer, "stbl", 4 )==0 ) // 
+	    {
+	    	header( "stbl", size, level );
+	    } else if( strncmp( (char *)buffer, "stsd", 4 )==0 ) // 
+	    {
+		stsd( fp, size-8 );
+	    } else if( strncmp( (char *)buffer, "stts", 4 )==0 ) // 
+	    {
+	    	SkipAtom( "stts", fp, size, level );
+	    } else if( strncmp( (char *)buffer, "stsc", 4 )==0 ) // 
+	    {
+	    	SkipAtom( "stsc", fp, size, level );
+	    } else if( strncmp( (char *)buffer, "stsz", 4 )==0 ) // 
+	    {	// Sample Size atom
+//	    	SkipAtom( "stsz", fp, size, level );
+	fprintf( stdout, "%8X : [%s] size=%8X\n", g_addr-8, "stsz", size );
+		stsz( fp, size-8 );
+	    } else if( strncmp( (char *)buffer, "stco", 4 )==0 ) // 
+	    {	// Chunk Offset atom
+//	    	SkipAtom( "stco", fp, size, level );
+	fprintf( stdout, "%8X : [%s] size=%8X\n", g_addr-8, "stco", size );
+		stco( fp, size-8 );
+	    } else if( strncmp( (char *)buffer, "udta", 4 )==0 ) // 
+	    {
+	    	SkipAtom( "udta", fp, size, level );
+	    } else if( strncmp( (char *)buffer, "smhd", 4 )==0 ) // 
+	    {
+	    	SkipAtom( "smhd", fp, size, level );
+	    } else if( strncmp( (char *)buffer, "stss", 4 )==0 ) // 
+	    {
+	    	SkipAtom( "stss", fp, size, level );
+	    } else if( strncmp( (char *)buffer, "tapt", 4 )==0 ) // netflix
+	    {
+	    	header( "tapt", size, level );
+	    } else if( strncmp( (char *)buffer, "clef", 4 )==0 ) // netflix
+	    {
+	    	SkipAtom( "clef", fp, size, level );
+	    } else if( strncmp( (char *)buffer, "prof", 4 )==0 ) // netflix
+	    {
+	    	SkipAtom( "clef", fp, size, level );
+	    } else if( strncmp( (char *)buffer, "enof", 4 )==0 ) // netflix
+	    {
+	    	SkipAtom( "enof", fp, size, level );
+	    } else if( strncmp( (char *)buffer, "sdtp", 4 )==0 ) // netflix
+	    {
+	    	SkipAtom( "sdtp", fp, size, level );
+	    } else if( strncmp( (char *)buffer, "meta", 4 )==0 ) // netflix
+	    {
+	    	header( "meta", size, level );
+	    } else if( strncmp( (char *)buffer, "keys", 4 )==0 ) // netflix
+	    {
+	    	SkipAtom( "keys", fp, size, level );
+	    } else if( strncmp( (char *)buffer, "ilst", 4 )==0 ) // netflix
+	    {
+	    	SkipAtom( "ilst", fp, size, level );
+	    } else {
+	    	fprintf( stdout, "Unknown [%s]@0x%X", buffer, g_addr-4 );
+		EXIT();
+	    }
+	    if( Size!=0 )
+	    if( (g_addr-start)>=Size )
+	    {
+	    	int i;
+		for( i=0; i<level; i++ )
+		{
+		    fprintf( stdout, "-" );
+		}
+		fprintf( stdout, "Done (%8X/%8X)\n", g_addr-start, Size );
+	    	return 0;
+	    }
+	}
+	return 0;
+}
+
+// ---------------------------------------------
+void Usage( char *prg )
+{
+	fprintf( stdout, "%s filename\n", prg );
+	exit( 1 );
+}
+
+int main( int argc, char *argv[] )
+{
+int i;
+int args=0;
+char *filename=NULL;
+
+	for( i=1; i<argc; i++ )
+	{
+	    if( argv[i][0]=='-' )
+	    {
+	    } else if( argv[i][0]=='+' )
+	    {
+	    } else {
+	    	switch( args )
+		{
+		case 0 :
+		    filename = argv[i];
+		    break;
+		default :
+		    Usage( argv[0] );
+		    break;
+		}
+	    }
+	}
+
+	if( filename==NULL )
+	{
+	    Usage( argv[0] );
+	}
+FILE *fp = fopen( filename, "rb" );
+	if( fp==NULL )
+	{
+	    fprintf( stdout, "Can't open [%s]\n", filename );
+	    exit( 1 );
+	}
+
+	ParseMOV( fp, 0, 0 );
+
+	fclose( fp );
+}
+

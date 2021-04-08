@@ -1,0 +1,44 @@
+
+/*
+	ts.cpp
+			2010.10.XX  by T.Oda
+
+	2011.4.8	Add '-a' option : bAll      : Save from begining
+	2011.4.8	Add '-s' option : bShowAddr : show address
+	2011.9.2	Add '+P' option : bPrintPCR : show PCR & address
+	2011.9.5		Output pcr.txt file
+	2011.9.13	'-W' option : Update PCR -WXX (PCR offset)
+			'-c' option : bCutEnd
+	2011.9.21	Output TTS.txt (TsPacketSize=192)
+	2011.9.27	PCR 33bit
+	2011.10.28	Debug : Last packet not broken
+	2011.10.29	Debug : No PCR : make adapt_len = (-1) : NG
+			Use TsPacketSize not WriteSize
+	2011.10.31	Change PES-XXXX.txt output format
+			TS-addr, TS-addr2, PES-addr, PES-size, PCR
+	2011.11.23	TTS PES-XXXX.bin not correct
+	2012. 4.23	PES-XXXX.txt : add TTS timestamp
+	2012. 5.13	'+D' option : Output in directory mode
+	2012. 5.14 	'-G' PcrGain : use with -W(PCR_UPDATE)
+	2012. 6. 4	ParsePts : Video E1-EF, Audio C1-DF support
+	2012. 6.14	*.pts : address fix
+	2012. 7. 6	TS2TTS
+	2012. 7. 9	PCR ins : fixed
+	2012. 7.10	g_addr over check
+			-g : PcrMbps : fixed bitrate
+	2012. 8. 9	Bug fix : SrcAddr check bRecord
+	2012. 8.23	+a : show adaptation field
+			+m : mask discontinuity indicator
+	2012. 9.10	use bGetPts : active when -r
+	2012. 9.11	+p : bGetPTS=1
+*/
+
+int bDebug=0;
+
+int ts( int argc, char *argv[] );
+
+int main( int argc, char *argv[] )
+{
+	return ts( argc, argv );
+}
+

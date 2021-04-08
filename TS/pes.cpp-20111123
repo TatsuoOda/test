@@ -1,0 +1,4756 @@
+
+/*
+	pes.cpp
+		2011.9.5 PTS/DTS output
+
+		2011.9.23 PTS/DTS update : fromPts,toPts, fromDts,toDts
+		2011.9.29 pic_timing : debugged
+		2011.9.29 00 00 03 count : debugged
+		2011.10.13 Audio PTS (00 00 01 C0)
+		2011.10.29 MODE_REMUX (+Remux)
+		2011.10.31 Change PES-XXXX.txt format
+			TS-addr(top), TS-addr(PES), PES-addr, PES-size, PCR
+		2011.11.17 use_data support by Akagawa
+ */
+
+#include <stdio.h>
+#include <stdlib.h>	// exit
+#include <string.h>	// strlen
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>	// close
+
+#include <sys/mman.h>	// mmap
+
+#include "tsLib.h"
+
+#define BUF_SIZE	1024*4
+//#define ADDR_MAX	1024*1024*16
+#define MAX_UPDATE	1024*64
+
+#define INVALID_OFFSET	0x12345678
+
+int bDebug = 0;
+int bDump  = 0;
+int bDumpSlice=0;
+int bDisplayTS=0;
+int bDebugGol=0;
+int bDebugGolB=0;
+int bShow=0;
+int bSkipError=0;
+int bNoDump=0;
+int bShowDetail=1;		// AVC show NAL parse
+int bShowGolomb=0;		// Dump Golomb parse
+int bDebugSkip=0;		// Dump with skipContent()
+int bShowBitAddr=0;		// Show BitAddr/Offset/Readed
+int bDebugSEI=0;		// Debug SEI
+int bShowNALinfo=1;		// CountNAL message
+int bDebugPES=0;		// Debug PES_header
+
+// 2011.1.14
+int bUseAddrFile=1;
+
+// make timing_info_present_flag=0 and remove timing_info
+int bRemoveTimingInfo=0;	
+
+int SpecialStartAddr=0;
+int SpecialStartBits=0;
+int SpecialEndAddr=0;
+int SpecialEndBits=0;
+
+int g_addr=0;
+//long long Addr[ADDR_MAX];
+#define MAX_DATA_SIZE	1024*64
+unsigned char dataBuf[MAX_DATA_SIZE];
+
+int nSequence=0;
+int nSequenceExtension=0;
+int nSequenceDisplayExtension=0;
+int nSelSt=(-1);
+int nSelEn=(-1);
+int bDumpSequenceDisplayExtension = 0;
+int bDumpSequenceExtension = 0;
+int bDumpSequence = 0;
+
+#define MAX_PACKETS 1024*64
+int Packets[MAX_PACKETS+4];	// 16bit
+
+unsigned long g_update_addr[MAX_UPDATE];
+unsigned long g_update_bits[MAX_UPDATE];
+unsigned long g_update_size[MAX_UPDATE];
+unsigned long g_update_data[MAX_UPDATE];
+int g_update_count=0;
+
+unsigned long g_update_addrS[MAX_UPDATE];
+unsigned long g_update_bit_S[MAX_UPDATE];
+unsigned long g_update_bit_E[MAX_UPDATE];
+unsigned long g_update_bit_T[MAX_UPDATE];
+unsigned long g_update_mode [MAX_UPDATE];
+int g_update_countS=0;
+
+int PtsOffset=INVALID_OFFSET;
+int DtsOffset=INVALID_OFFSET;
+int fromPts=INVALID_OFFSET;
+int toPts=INVALID_OFFSET;
+int fromDts=INVALID_OFFSET;
+int toDts=INVALID_OFFSET;
+
+// ---------------------------------------------
+// AVC
+int avc_pic_struct_present_flag = (-1);
+int avc_nal_hrd_parameters_present_flag=(-1);
+int avc_vcl_hrd_parameters_present_flag=(-1);
+int avc_cpb_cnt = (-1);
+int avc_CpgDpbDelaysPresentFlag = (-1);
+int avc_time_offset_length = (-1);
+int avc_CpbDpbDelaysPresentFlag = (-1);
+int avc_initial_cpb_removal_delay_length = (-1);
+int avc_cpb_removal_delay_length = (-1);
+int avc_dpb_output_delay_length = (-1);
+int avc_separate_colour_plane_flag=(-1);
+int avc_frame_mbs_only_flag = (-1);
+
+int n_vui_parameters = 0;
+int n_sequenceParameters = 0;
+int n_pan_scan = 0;
+
+// ---------------------------------------------
+// header item
+//
+#define ID_HSV		 1
+#define ID_VSV		 2
+#define ID_ARI		 3
+#define ID_FRC		 4
+#define ID_PALI		 5
+#define ID_PS		 6
+#define ID_CP		 7
+#define ID_TC		 8
+#define ID_MXC		 9
+#define ID_DHS		10
+#define ID_DVS		11
+// for AVC
+#define ID_SARW		12
+#define ID_SARH		13
+#define ID_LVL		14
+//
+#define ID_PANL		15
+#define ID_PANR		16
+#define ID_PANT		17
+#define ID_PANB		18
+
+#define ID_OVSP		19	// present_flag
+#define ID_OVSA		20	// appropriate_flag
+
+#define ID_MAX		21
+
+typedef struct HeaderItem {
+int id;
+char name[10];
+} headerItem_t;
+
+static struct HeaderItem headerItem[] = {
+ID_HSV,		"HSV",		// horizontal_size_value
+ID_VSV,		"VSV",		// vertical_size_value
+ID_ARI,		"ARI",		// aspect_ratio_information
+ID_FRC,		"FRC",		// frame_rate
+ID_PALI,	"PALI",		// profile_and_level_indication
+ID_PS,		"PS",		// prograssive_sequence
+ID_CP,		"CP",		// colour_primaries
+ID_TC,		"TC",		// transfer_characteristics
+ID_MXC,		"MXC",		// matrix_coefficients
+ID_DHS,		"DHS",		// display_horizontal_size
+ID_DVS,		"DVS",		// display_vertical_size
+
+ID_SARW,	"SARW",		// sar_width
+ID_SARH,	"SARH",		// sar_height
+ID_LVL,		"LVL",		// level
+
+ID_PANL,	"PANL",		// pan_left_offset
+ID_PANR,	"PANR",		// pan_right_offset
+ID_PANT,	"PANT",		// pan_top_offset
+ID_PANB,	"PANB",		// pan_bottom_offset
+
+ID_OVSP,	"OVSP",		// overscan_present_flag
+ID_OVSA,	"OVSA",		// overscan_appropriate_flag
+
+-1,		""
+};
+
+int items[ID_MAX];
+int value[ID_MAX];
+
+#if 0
+int SrcAddr( int addr )
+{
+int i;
+unsigned long addr1=0, addr2=0;
+//	fprintf( stdout, "SrcAddr(%X)\n", addr );
+	for( i=0; (i*2)<ADDR_MAX; i++ )
+	{
+	    unsigned long nAddr1=Addr[i*2+0];
+	    unsigned long nAddr2=Addr[i*2+1];
+//	    fprintf( stdout, "%4d:%8X,%8X\n", nAddr1, nAddr2 );
+	    if( addr<nAddr1 )
+	    {
+	    	return addr2 + (addr-addr1);
+	    }
+	    addr1 = nAddr1;
+	    addr2 = nAddr2;
+	}
+	return 0xFFFFFFFF;
+}
+#endif
+
+// BitAddr
+#define BIT_BUFFER_SIZE	1024*64
+
+static unsigned char BitBuffer[BIT_BUFFER_SIZE];
+static unsigned long BitAddr = 0;
+static int BitOffset=0;
+static int BitReaded=0;
+static int BitSkip  =0;
+static int nZero=0;
+static unsigned long userdata_ptsh, userdata_ptsl;
+static bool b_user_data=false;
+
+void ShowBitAddr( )
+{
+	if( bShowBitAddr )
+	{
+	    fprintf( stdout, "BitAddr  =0x%X(0x%X)\n", 
+	    	BitAddr, SrcAddr(BitAddr) );
+	    fprintf( stdout, "BitAddr  =0x%X\n", BitAddr );
+	    fprintf( stdout, "BitOffset=%d\n", BitOffset );
+	    fprintf( stdout, "BitReaded=%d\n", BitReaded );
+	}
+}
+
+void EXIT( )
+{
+	fprintf( stdout, "----- Exiting -----\n" );
+	fprintf( stdout, "Addr(%X,%X)\n", g_addr, SrcAddr(g_addr) );
+	exit( 1 );
+}
+
+void CannotRead( char *str )
+{
+	if( str!=NULL )
+	    fprintf( stdout, "Can't read %s@0x%X(0x%X)\n", 
+	    	str, g_addr, SrcAddr(g_addr) );
+	else
+	    fprintf( stdout, "Can't read @0x%X(0x%X)\n", 
+	    	g_addr, SrcAddr(g_addr) );
+}
+
+int Compare( char strA[], char strB[], int len )
+{
+int i;
+int ret=0;
+	for( i=0; i<len; i++ )
+	{
+	    if( strA[i] != strB[i] )
+		ret++;
+	    if( strA[i]==0 )
+	    	break;
+	    if( strB[i]==0 )
+	    	break;
+	}
+	return ret;
+}
+
+int GetValue( char str[], int &Error )
+{
+int len = strlen( str );
+int i;
+int bHex  = 0;
+int value = 0;
+int sign = 1;
+
+	Error=0;
+	if( len>2 )	
+	    if( Compare( str, "0x", 2 )==0 )
+	    	bHex = 1;
+
+	if( bHex )
+	{
+	    for( i=2; i<len; i++ )
+	    {
+	    	if( (str[i]>='0') && (str[i]<='9') )
+		{
+		    value = value*16 + (str[i]-'0');
+		} else if( (str[i]>='A') && (str[i]<='F') )
+		{
+		    value = value*16 + (str[i]-'A'+10);
+		} else if( (str[i]>='a') && (str[i]<='f') )
+		{
+		    value = value*16 + (str[i]-'a'+10);
+		} else {
+		    Error++;
+		    break;
+		}
+	    }
+	} else {
+	    for( i=0; i<len; i++ )
+	    {
+	    	if( (i==0) && (str[i]=='-') )
+		{
+		    sign = (-1);
+		} else if( (str[i]>='0') && (str[i]<='9') )
+		{
+		    value = value*10 + (str[i]-'0');
+		} else {
+		    Error++;
+		    break;
+		}
+	    }
+	}
+	return value*sign;
+} 
+
+int gread( unsigned char *buffer, int sz, int n, FILE *fp )
+{
+int readed;
+	readed = fread( buffer, sz, n, fp );
+	if( bDebug )
+	    fprintf( stdout, "%d bytes readed\n", sz*n );
+	if( readed>0 )
+	    g_addr += (sz*readed);
+	return readed;
+}
+
+int DoUpdate( int addr, int bitOffset, int size, int value )
+{
+#if 0
+	fprintf( stdout, "DoUpdate(0x%X,%d,%d,%d)\n",
+		addr, bitOffset, size, value );
+#endif
+	if( g_update_count>=MAX_UPDATE )
+	{
+	    fprintf( stdout, "g_update_count is too large (%d>%d)\n",
+		    g_update_count, MAX_UPDATE );
+	    EXIT();
+	}
+	g_update_addr[g_update_count] = addr;
+	g_update_bits[g_update_count] = bitOffset;
+	g_update_size[g_update_count] = size;
+	g_update_data[g_update_count] = value;
+	fprintf( stdout, "update %X(%X),%2d,%2d,0x%02X\n",
+	    g_update_addr[g_update_count],
+	    SrcAddr(g_update_addr[g_update_count]),
+	    g_update_bits[g_update_count],
+	    g_update_size[g_update_count],
+	    g_update_data[g_update_count] );
+	g_update_count++;
+}
+
+#define MODE_PTS	0
+#define MODE_DTS	1
+
+#if 0
+int TS( unsigned long High, unsigned long Low, 
+	unsigned long *pTSH, unsigned long *pTSL )
+{
+unsigned long TS32_30, TS29_15, TS14_00;
+unsigned long TS32, TS31_00;
+	TS32_30 = (High>>1) & 0x0007;
+	TS29_15 = (Low>>17) & 0x7FFF;
+	TS14_00 = (Low>> 1) & 0x7FFF;
+	TS32 = TS32_30>>2;
+	TS31_00 = (TS32_30<<30) | (TS29_15<<15) | (TS14_00);
+	*pTSH = TS32;
+	*pTSL = TS31_00;
+	return TS31_00;
+}
+#endif
+
+int UpdateTS( int stAddr, unsigned long TSH, unsigned long TSL, 
+	int modeTS, int bPTS, int bDTS, int TSoffset )
+{
+int code=0;
+int nTS[5];
+	fprintf( stdout, "UpdateTS(%02X:%08X,%d)\n", TSH, TSL, TSoffset );
+	long long TSLL = (((long long)TSH)<<32)
+		       | (((long long)TSL)<< 0);
+        fprintf( stdout, "TSLL=%08X,%08X\n", (int)(TSLL>>32), (int)TSLL );
+	TSLL += TSoffset;
+        fprintf( stdout, "TSLL=%08X,%08X\n", (int)(TSLL>>32), (int)TSLL );
+	switch( modeTS )
+	{
+	case MODE_PTS :
+	    if( bDTS==0 )
+	    	code = 2;
+	    else
+	    	code = 3;
+	    break;
+	case MODE_DTS :
+	    if( bPTS==0 )
+		code = 0;
+	    else
+		code = 1;
+	    break;
+	default :
+	    fprintf( stdout, "Illegal\n" );
+	    EXIT();
+	}
+	// 4,3,1
+	nTS[0] = (code<<4) | (((TSLL>>30) & 7)<<1) | 1;
+	nTS[1] =  ((TSLL>>22) & 0xFF);
+	nTS[2] = (((TSLL>>15) & 0xFF)<<1) | 1;
+	nTS[3] =  ((TSLL>> 7) & 0xFF);
+	nTS[4] = (((TSLL>> 0) & 0xFF)<<1) | 1;
+	DoUpdate( stAddr, 0, 8, nTS[0] );
+	DoUpdate( stAddr, 8, 8, nTS[1] );
+	DoUpdate( stAddr,16, 8, nTS[2] );
+	DoUpdate( stAddr,24, 8, nTS[3] );
+	DoUpdate( stAddr,32, 8, nTS[4] );
+	int TS_H = (nTS[0]<< 0);
+	int TS_L = (nTS[1]<<24)
+		 | (nTS[2]<<16)
+		 | (nTS[3]<< 8)
+		 | (nTS[4]<< 0);
+	unsigned long nTSH, nTSL;
+	TS( TS_H, TS_L, &nTSH, &nTSL );
+	fprintf( stdout, "%02X,%08X\n", TS_H, TS_L );
+	fprintf( stdout, "new TS=%02X:%08X\n", nTSH, nTSL );
+}
+
+int PES_header( FILE *fp, unsigned char buffer[], int mode,
+	unsigned long &PTSH, unsigned long &PTSL, 
+	unsigned long &DTSH, unsigned long &DTSL )
+{
+int len;
+int readed;
+int i;
+int offset=0;
+	PTSH=0xFFFFFFFF;
+	PTSL=0xFFFFFFFF;
+	DTSH=0xFFFFFFFF;
+	DTSL=0xFFFFFFFF;
+	if( mode>0 )
+	{
+	fprintf( stdout, "------------------------\n" );
+	fprintf( stdout, "PES_header(%X,%X)\n", g_addr, SrcAddr(g_addr) );
+	}
+	readed = gread( buffer, 1, 2, fp );
+	len = (buffer[0]<<8) | buffer[1];
+	if( bDebugPES )
+	fprintf( stdout, "PES_len=%8X\n", len );
+	readed = gread( buffer, 1, 3, fp );
+	if( readed<3 )
+	{
+	    CannotRead( "PES header top" );
+	    return -1;
+	}
+	int PES_header_data_length = buffer[2];
+#if 0
+	for( i=0; i<3; i++ )
+	{
+	    fprintf( stdout, "%02X ", buffer[i] );
+	}
+	fprintf( stdout, "\n" );
+#endif
+	int bPTS=0;
+	int bDTS=0;
+	int flag1=buffer[0];
+	int flag2=buffer[1];
+	if( (flag1>>6)!=2 )
+	    fprintf( stdout, "Invalid flag1 (%02X)\n", flag1 );
+	bPTS = (flag2 & 0x80) ? 1 : 0;
+	bDTS = (flag2 & 0x40) ? 1 : 0;
+	flag1 = flag1 & 0x3F;
+	flag2 = flag2 & 0x3F;
+#if 0
+	fprintf( stdout, "%02X:%d,%d:%02X, %02X\n", 
+	    flag1, bPTS, bDTS, flag2, PES_header_data_length );
+#endif
+	offset=3;
+	if( bDebugPES )
+	fprintf( stdout, "PES_header_data_length=%d\n",
+		PES_header_data_length );
+
+	int head_addr = g_addr-offset;
+	int stAddr, enAddr;
+	readed = gread( &buffer[3], 1, PES_header_data_length, fp );
+	if( readed<PES_header_data_length )
+	{
+	    CannotRead( "PES header data" );
+	    return -1;
+	}
+	int PTS_H=(-1), PTS_L=(-1), DTS_H=(-1), DTS_L=(-1);
+	if( bPTS )
+	{
+	    PTS_H = (buffer[offset+0]<< 0);
+	    PTS_L = (buffer[offset+1]<<24)
+		  | (buffer[offset+2]<<16)
+		  | (buffer[offset+3]<< 8)
+		  | (buffer[offset+4]<< 0);
+	    if( bDisplayTS )
+	    fprintf( stdout, "PTS=%02X:%08X (%02X,%02X,%02X,%02X,%02X)\n",
+		    PTS_H, PTS_L, 
+		    buffer[offset+0], buffer[offset+1], 
+		    buffer[offset+2], buffer[offset+3],
+		    buffer[offset+4] );
+	    TS( PTS_H, PTS_L, &PTSH, &PTSL );
+	    if( bDisplayTS )
+	    fprintf( stdout, "PTS=%02X:%08X\n", PTSH, PTSL );
+
+	    stAddr = head_addr+offset+0;
+	    enAddr = head_addr+offset+5;
+	    if( mode>0 )
+		fprintf( stdout, "PTS(%8X,%8X)=%8X,%08X\n", 
+			stAddr, enAddr, PTSH, PTSL );
+	    if( PtsOffset!=INVALID_OFFSET )
+	    {
+	    	if( ((fromPts!=INVALID_OFFSET) && (toPts!=INVALID_OFFSET)
+		  && (PTSL>=fromPts) && (PTSL<=toPts))
+
+		  || (((fromPts!=INVALID_OFFSET) && (toPts==INVALID_OFFSET))
+		  && (PTSL>=fromPts) )
+
+		  || (((fromPts==INVALID_OFFSET) && (toPts!=INVALID_OFFSET))
+		  && (PTSL<=toPts) )
+
+		  || ((fromPts==INVALID_OFFSET) && (toPts==INVALID_OFFSET))
+		)
+		{
+		UpdateTS( stAddr, PTSH, PTSL, MODE_PTS, bPTS, bDTS, PtsOffset );
+#if 0
+		fprintf( stdout, "PtsUpdate(%8X,%8X)\n", PTSL, PtsOffset );
+#endif
+		}
+	    }
+	    offset+=5;
+	} else {
+	    if( bDump )
+		fprintf( stdout, "No PTS\n" );
+	}
+	if( bDTS )
+	{
+	    DTS_H = (buffer[offset+0]<< 0);
+	    DTS_L = (buffer[offset+1]<<24)
+		  | (buffer[offset+2]<<16)
+		  | (buffer[offset+3]<< 8)
+		  | (buffer[offset+4]<< 0);
+	    if( bDisplayTS )
+	    fprintf( stdout, "DTS=%02X:%08X (%02X,%02X,%02X,%02X,%02X)\n",
+		    DTS_H, DTS_L, 
+		    buffer[offset+0], buffer[offset+1], 
+		    buffer[offset+2], buffer[offset+3],
+		    buffer[offset+4] );
+	    TS( DTS_H, DTS_L, &DTSH, &DTSL );
+	    if( bDisplayTS )
+	    fprintf( stdout, "DTS=%02X:%08X\n", DTSH, DTSL );
+
+	    stAddr = head_addr+offset+0;
+	    enAddr = head_addr+offset+5;
+	    if( mode>0 )
+	    fprintf( stdout, "DTS(%8X,%8X)=%8X,%08X\n", 
+	    	stAddr, enAddr, DTSH, DTSL );
+	    if( DtsOffset!=INVALID_OFFSET )
+	    	if( ((fromDts!=INVALID_OFFSET) && (toDts!=INVALID_OFFSET)
+		  && (DTSL>=fromDts) && (DTSL<=toDts))
+		  || ((fromDts==INVALID_OFFSET) && (toDts==INVALID_OFFSET))
+		)
+		UpdateTS( stAddr, DTSH, DTSL, MODE_DTS, bPTS, bDTS, DtsOffset );
+
+	    offset+=5;
+	} else {
+	    if( bDump )
+		fprintf( stdout, "No DTS\n" );
+	}
+	if( bDisplayTS )
+	if( bPTS & bDTS )
+	    fprintf( stdout, "PTSDTS=%02X:%08X,%02X:%08X diff(%5d)\n",
+	    	PTSH, PTSL, DTSH, DTSL, (PTSL-DTSL) );
+	    else if( bPTS )
+	    fprintf( stdout, "PTSDTS=%02X:%08X,--:-------- diff(%5d)\n",
+	    	PTSH, PTSL, 0 );
+	    else if( bDTS )
+	    fprintf( stdout, "PTSDTS=--:--------,%02X:%08X diff(  ?  )\n",
+	    	DTSH, DTSL );
+	if( mode>0 )
+	fprintf( stdout, "------------------------\n" );
+//	return 0;
+    userdata_ptsh = PTSH;
+    userdata_ptsl = PTSL;
+	return len;
+}
+
+void InitBitStream( )
+{
+	BitAddr  =g_addr;
+	BitOffset=0;
+	BitReaded=0;
+	BitSkip  =0;
+	nZero    =0;
+}
+int GetBitStream( FILE *fp, int nBit )
+{
+static unsigned char BitMask[] = {
+0xFF, 0x7F, 0x3F, 0x1F, 0x0F, 0x07, 0x03, 0x01
+};
+	if( bDebug )
+	fprintf( stdout, "GetBitStream(%d)\n", nBit );
+	int nPos = BitOffset/8;
+	if( (BitReaded/8)>=BIT_BUFFER_SIZE )
+	{
+	    fprintf( stdout, "BitBuffer full (%d)\n", BitReaded );
+	    EXIT();
+	}
+	if( (BitOffset+nBit)>BitReaded )
+	{	// たりないのでよむ
+	    int ii;
+	    int nByte = BitOffset+nBit-BitReaded;
+	    nByte = (nByte+7)/8;
+	    if( bDebug )
+	    fprintf( stdout, "Requested %d bytes\n", nByte );
+	    int readed = gread( &BitBuffer[BitReaded/8], nByte, 1, fp );
+	    if( readed<1 )
+	    {
+		CannotRead( NULL );
+		return -1;
+	    }
+	    for( ii=0; ii<nByte; ii++ )
+	    {
+	    	if( nZero==2 )
+		{
+		    if( BitBuffer[BitReaded/8+ii]==3 )
+		    {
+		    	// 00 00 03
+			fprintf( stdout, "Found(00 00 03)@0x%X+%d/8\n",
+				BitAddr, BitOffset );
+#if 0
+int iii;
+for( iii=0;iii<nByte;iii++ )
+{
+    fprintf( stdout, "%02X ", BitBuffer[BitReaded/8+iii] );
+}
+fprintf( stdout, "\n" );
+#endif
+			BitSkip++;
+			for( ; ii<nByte; ii++ )
+			{
+			    BitBuffer[BitReaded/8+ii] 
+			    	= BitBuffer[BitReaded/8+ii+1];
+			}
+			readed = gread( &BitBuffer[BitReaded/8+nByte-1],
+				1, 1, fp );
+			if( readed<1 )
+			{
+			    CannotRead( NULL );
+			    return -1;
+			}
+			nZero=0;
+#if 0
+for( iii=0;iii<nByte;iii++ )
+{
+    fprintf( stdout, "%02X ", BitBuffer[BitReaded/8+iii] );
+}
+fprintf( stdout, "\n" );
+#endif
+			break;
+		    }
+		} 
+	    	if( BitBuffer[BitReaded/8+ii] == 0 )
+		    nZero++;
+		else
+		    nZero=0;
+	    }
+	    if( bDebug )
+	    {
+	    fprintf( stdout, "%d bits readed\n", readed*nByte*8 );
+	    for( ii=0; ii<nByte; ii++ )
+	    {
+	    	fprintf( stdout, "%02X ", BitBuffer[BitReaded/8+ii] );
+	    }
+	    fprintf( stdout, "\n" );
+	    }
+	    BitReaded += nByte*8;
+	}
+	unsigned int data=0;
+	int rBit = nBit+BitOffset-nPos*8;
+	int rP = 0;
+	while( rBit>0 )
+	{
+	    data = (data<<8) | BitBuffer[nPos+rP]; 
+	    if( rP==0 )
+	    {
+	    	if( BitOffset%8 )
+		    data = data & BitMask[BitOffset%8];
+	    }
+	    rBit-=8;
+	    rP++;
+	}
+	BitOffset += nBit;
+	if( rBit<0 )
+	    data = data>>(-rBit);
+	if( bDebugGolB )
+	{
+	    int n;
+	    int mask = 1<<(nBit-1);
+	    int v = data;
+	    for( n=0; n<nBit; n++ )
+	    {
+	    	if( v & mask )
+		    fprintf( stdout, "1 " );
+		else
+		    fprintf( stdout, "0 " );
+		v=v<<1;
+	    }
+	    fprintf( stdout, "\n" );
+	}
+
+	if( bDebug )
+	fprintf( stdout, "BitOffset=%d, BitReaded=%d, data=0x%X\n",
+		BitOffset, BitReaded, data );
+	return data;
+}
+
+// --------------------------------------------------
+// Exp-Golomb codes
+//#define MAX_BASE	26
+#define MAX_BASE	30
+int GetBitStreamGolomb( FILE *fp )
+{
+int nBit;
+int i, n;
+int bValue, value=0;
+int base[MAX_BASE];
+/*
+static int base[] = {
+	0, 1, 3, 7, 15, 31, 
+};
+*/
+	if( bShowGolomb )
+	fprintf( stdout, "Golomb:" );
+	base[0] = 0;
+	for( n=1; n<MAX_BASE; n++ )
+	{
+	    base[n] = base[n-1]*2+1;
+	}
+	bDebugGolB = 0;
+	for( n=0; n<MAX_BASE; n++ )
+	{
+	    nBit = GetBitStream( fp, 1 );
+	    if( bShowGolomb )
+	    fprintf( stdout, "%d ", nBit );
+	    if( nBit==1 )
+	    	break;
+	}
+	if( n>=MAX_BASE )
+	{
+	    fprintf( stdout, "Invalid Golomb\n" );
+	    return -1;
+	}
+	bValue = 0;
+	for( i=0; i<n; i++ )
+	{
+	    nBit = GetBitStream( fp, 1 );
+	    if( bShowGolomb )
+	    fprintf( stdout, "%d ", nBit );
+	    bValue = (bValue<<1) | nBit;
+	}
+	bDebugGolB = bDebugGol;
+	value = base[n] + bValue;
+	if( bShowGolomb )
+	fprintf( stdout, " : value=%d (%X,%d=%X,%d)\n", 
+		value, BitAddr, BitOffset, BitAddr+BitOffset/8, BitOffset%8 );
+	return value;
+}
+
+int GolombNext( int cVal, int step )
+{
+int base[MAX_BASE];	// 0, 1, 3, 7, 15, 31, 
+int value = 0;
+int n, i;
+	base[0] = 0;
+	for( n=1; n<MAX_BASE; n++ )
+	{
+	    base[n] = base[n-1]*2+1;
+//	    fprintf( stdout, "base[%d]=%d, cVal=%d\n", n, base[n], cVal );
+	    if( cVal<base[n] )
+	    	break;
+	}
+	if( n>=MAX_BASE )
+	    return cVal;
+	value = cVal;
+	if( step>=0 )
+	{
+	    for( i=0; i<step; i++ )
+	    {
+		value=value+1;
+		if( value>=base[n] )
+		    value = base[n-1];
+	    }
+	} else {
+	    for( i=0; i<-step; i++ )
+	    {
+		value=value-1;
+		if( value<=base[n-1] )
+		    value = base[n]-1;
+	    }
+	}
+//	fprintf( stdout, "GolombNext(%d) = %d\n", cVal, value );
+	return value;
+}
+
+int GolombValue( int cVal )
+{
+int base[MAX_BASE+1];	// 0, 1, 3, 7, 15, 31, 
+int value =0;
+int n;
+	base[0] = 0;
+	for( n=0; n<MAX_BASE; n++ )
+	{
+	    base[n+1] = base[n]*2+1;
+	    if( cVal<base[n+1] )
+	    	break;
+	}
+	if( n>=MAX_BASE )
+	{
+	    fprintf( stdout, "Can't convert GolmbValue(%d)\n", cVal );
+	    EXIT();
+	}
+	value = (1<<n) + (cVal-base[n]);
+//	fprintf( stdout, "GolombValue(%d) = 0x%X\n", cVal, value );
+	return value;
+}
+
+int UpdateProcedure( int nCycle, int id, int size )
+{
+	if( nSelSt>=0 )
+	{
+#if 0
+	    fprintf( stdout, "nSelSt=%d, Sequence=%d, %d\n",
+		nSelSt, nCycle, items[ID_HSV] );
+#endif
+	    if( (nCycle>=nSelSt) && ((nSelEn<0) || (nCycle<=nSelEn)) )
+	    if( items[id]>0 )
+	    {
+	    	DoUpdate( BitAddr, BitOffset, size, value[id] );
+		return 1;
+	    }
+	}
+	return 0;
+}
+
+int UpdateProcedureGolomb( int nCycle, int id, int size, int nValue )
+{
+	if( nSelSt>=0 )
+	{
+	    if( (nCycle>=nSelSt) && ((nSelEn<0) || (nCycle<=nSelEn)) )
+	    if( items[id]>0 )
+	    {
+	    	if( g_update_count>=MAX_UPDATE )
+		{
+		    fprintf( stdout, "Too large g_update_count(%d>%d)\n",
+		    	g_update_count, MAX_UPDATE );
+		}
+		fprintf( stdout, "UpdateProcedureGolomb(%X,%d,%d:%d)\n",
+			BitAddr, BitOffset-size, size, nValue );
+	    	g_update_addr[g_update_count] = BitAddr;
+		g_update_bits[g_update_count] = BitOffset-size;
+		g_update_size[g_update_count] = size;
+//		g_update_data[g_update_count] = value[id];
+		g_update_data[g_update_count] = nValue;
+		fprintf( stdout, "updateG %X,%d,%d,%d\n",
+		    g_update_addr[g_update_count],
+		    g_update_bits[g_update_count],
+		    g_update_size[g_update_count],
+		    g_update_data[g_update_count] );
+		g_update_count++;
+	    }
+	}
+	return 0;
+}
+
+
+int Sequence( FILE *fp, unsigned char buffer[] )
+{
+/*
+HSV	12bit
+VSV	12bit
+ARI	4bit
+FRC	4bit
+BRV	18bit
+MRK	1bit
+VBSV	10bit
+CPF	1bit
+LIQM	1bit
+IQM	8*64bit
+LNIQM	1bit
+NIQM	8*64bit
+---------------
+(512*2)*n+64bit
+1088bit=136byte
+*/
+int HSV, VSV, ARI, FRC, BRV, MRK, VBSV, CPF, LIQM, LNIQM;
+int dummy, i;
+	fprintf( stdout, "Sequence() : %8X, %8X\n", 
+		g_addr, SrcAddr(g_addr) );
+	fprintf( stdout, "**********************************************\n" );
+ 	InitBitStream();
+	UpdateProcedure( nSequence, ID_HSV, 12 );
+ 	HSV = GetBitStream( fp, 12 );
+	UpdateProcedure( nSequence, ID_VSV, 12 );
+ 	VSV = GetBitStream( fp, 12 );
+	UpdateProcedure( nSequence, ID_ARI,  4 );
+ 	ARI = GetBitStream( fp,  4 );
+	UpdateProcedure( nSequence, ID_FRC,  4 );
+ 	FRC = GetBitStream( fp,  4 );
+ 	BRV = GetBitStream( fp, 18 );
+ 	MRK = GetBitStream( fp,  1 );
+ 	VBSV= GetBitStream( fp, 10 );
+ 	CPF = GetBitStream( fp,  1 );
+ 	LIQM= GetBitStream( fp,  1 );
+	if( LIQM>0 )
+	{
+	    for( i=0; i<16; i++ )
+		dummy= GetBitStream( fp,  32 );
+	}
+ 	LNIQM= GetBitStream( fp,  1 );
+	if( LNIQM>0 )
+	{
+	    for( i=0; i<16; i++ )
+		dummy= GetBitStream( fp,  32 );
+	}
+	if( bDumpSequence )
+	{
+	    fprintf( stdout, "HSV=%d\n", HSV );
+	    fprintf( stdout, "VSV=%d\n", VSV );
+	    fprintf( stdout, "ARI=%d\n", ARI );
+	    fprintf( stdout, "FRC=%d\n", FRC );
+	    fprintf( stdout, "BRV=%d\n", BRV );
+	}
+	nSequence++;
+	return 0;
+}
+
+int SequenceExtension( FILE *fp, unsigned char buffer[] )
+{
+int PALI, PS, CF, HSE, VSE, BRE, MRK, VBSE, LD, FREn, FREd;
+	fprintf( stdout, "SequenceExtentsion() : %8X,%8X\n", 
+		g_addr, SrcAddr(g_addr) );
+	fprintf( stdout, "----------------------------------------------\n" );
+	UpdateProcedure( nSequence, ID_PALI, 8 );
+	PALI = GetBitStream( fp, 8 );
+	UpdateProcedure( nSequence, ID_PS,   1 );
+	PS   = GetBitStream( fp, 1 );
+	CF   = GetBitStream( fp, 2 );
+	HSE  = GetBitStream( fp, 2 );
+	VSE  = GetBitStream( fp, 2 );
+	BRE  = GetBitStream( fp,12 );
+	MRK  = GetBitStream( fp, 1 );
+	VBSE = GetBitStream( fp, 8 );
+	LD   = GetBitStream( fp, 1 );
+	FREn = GetBitStream( fp, 2 );
+	FREd = GetBitStream( fp, 2 );
+	if( bDumpSequenceExtension )
+	{
+	    fprintf( stdout, "PALI=%d\n", PALI );
+	    fprintf( stdout, "PS  =%d\n", PS   );
+	    fprintf( stdout, "CF  =%d\n", CF   );
+	    fprintf( stdout, "LD  =%d\n", LD   );
+	}
+	nSequenceExtension++;
+	return 0;
+}
+
+
+int SequenceDisplayExtension( FILE *fp, unsigned char buffer[] )
+{
+int VF, CD, CP, TC, MXC, DHS, MRK, DVS;
+	CP = (-1);
+	TC = (-1);
+	MXC= (-1);
+
+	fprintf( stdout, "SequenceDisplayExtentsion() : %8X,%8X\n", 
+		g_addr, SrcAddr(g_addr) );
+	ShowBitAddr( );
+	fprintf( stdout, "==============================================\n" );
+	VF   = GetBitStream( fp, 3 );
+	CD   = GetBitStream( fp, 1 );
+	if( CD==1 )
+	{
+	    UpdateProcedure( nSequence, ID_CP,   8 );
+	    CP   = GetBitStream( fp, 8 );
+	    UpdateProcedure( nSequence, ID_TC,   8 );
+	    TC   = GetBitStream( fp, 8 );
+	    UpdateProcedure( nSequence, ID_MXC,  8 );
+	    MXC  = GetBitStream( fp, 8 );
+	}
+	UpdateProcedure( nSequence, ID_DHS, 14 );
+	DHS  = GetBitStream( fp,14 );
+	MRK  = GetBitStream( fp, 1 );
+	UpdateProcedure( nSequence, ID_DVS, 14 );
+	DVS  = GetBitStream( fp,14 );
+	if( bDumpSequenceDisplayExtension )
+	{
+	    fprintf( stdout, "VF =%d\n", VF );
+	    fprintf( stdout, "CD =%d\n", CD );
+	    fprintf( stdout, "CP =%d\n", CP );
+	    fprintf( stdout, "TC =%d\n", TC );
+	    fprintf( stdout, "MXC=%d\n", MXC );
+	    fprintf( stdout, "DHS=%d\n", DHS );
+	    fprintf( stdout, "DVS=%d\n", DVS );
+	}
+	nSequenceDisplayExtension++;
+	return 0;
+}
+int SequenceScalableExtension( FILE *fp, unsigned char buffer[] )
+{
+int SM, LID, LLPHS, MRK, LLPVS, HSFm, HSFn, VSFm, VSFn, PME, MTPS, PMO, PMF;
+	fprintf( stdout, "SequenceScalableExtentsion()\n" );
+	SM   = GetBitStream( fp, 2 );
+	LID  = GetBitStream( fp, 4 );
+	LLPHS= GetBitStream( fp,14 );
+	MRK  = GetBitStream( fp, 1 );
+	LLPVS= GetBitStream( fp,14 );
+	HSFm = GetBitStream( fp, 5 );
+	HSFn = GetBitStream( fp, 5 );
+	VSFm = GetBitStream( fp, 5 );
+	VSFn = GetBitStream( fp, 5 );
+	PME  = GetBitStream( fp, 1 );
+	MTPS = GetBitStream( fp, 1 );
+	PMO  = GetBitStream( fp, 3 );
+	PMF  = GetBitStream( fp, 3 );
+	return 0;
+}
+
+int PictureCodingExtention( FILE *fp, unsigned char buffer[] )
+{
+int FHFC, FVFC, BHFC, BVFC, IDP, PSTR, TFF, FPFD, CMV, QST, IVF;
+int AS, RFF, C420T, PF, CDF, VA, FS, SC, BA, SCP;
+	if( bShow )
+	fprintf( stdout, "PictureCodingExtention() : " );
+	FHFC = GetBitStream( fp, 4 );
+	FVFC = GetBitStream( fp, 4 );
+	BHFC = GetBitStream( fp, 4 );
+	BVFC = GetBitStream( fp, 4 );
+	IDP  = GetBitStream( fp, 2 );
+	PSTR = GetBitStream( fp, 2 );
+	TFF  = GetBitStream( fp, 1 );
+	FPFD = GetBitStream( fp, 1 );
+	CMV  = GetBitStream( fp, 1 );
+	QST  = GetBitStream( fp, 1 );
+	IVF  = GetBitStream( fp, 1 );
+	AS   = GetBitStream( fp, 1 );
+	RFF  = GetBitStream( fp, 1 );
+	C420T= GetBitStream( fp, 1 );
+	PF   = GetBitStream( fp, 1 );
+	CDF  = GetBitStream( fp, 1 );
+#if 0	// PAL
+	VA   = GetBitStream( fp, 1 );
+	FS   = GetBitStream( fp, 3 );
+	SC   = GetBitStream( fp, 1 );
+	BA   = GetBitStream( fp, 7 );
+	SCP  = GetBitStream( fp, 8 );
+#endif
+	fprintf( stdout, "PSTR=%d\n", PSTR );
+	return 0;
+}
+
+int PictureDisplayExtension( FILE *fp, unsigned char buffer[] )
+{
+int FCHO, FCVO;
+int MRK;
+int i;
+//	if( bShow )
+	fprintf( stdout, "PictureDisplayExtension() : " );
+	ShowBitAddr( );
+/*
+	ESC,ESCI,<FCHO,MRK,FCVO,MRK>
+*/
+	for( i=0; i<2; i++ )
+	{
+	    FCHO = GetBitStream( fp, 16 );// Frame Center Horizontal Offset
+	    MRK  = GetBitStream( fp,  1 );// Marker Bit
+	    FCVO = GetBitStream( fp, 16 );// Frame Center Vertical Offset
+	    MRK  = GetBitStream( fp,  1 );// Marker Bit
+	    fprintf( stdout, "FCHO[%d]=%4d\n", i, FCHO );
+	    fprintf( stdout, "FCVO[%d]=%4d\n", i, FCVO );
+	}
+	return 0;
+}
+
+int QuantMatrixExtension( FILE *fp, unsigned char buffer[] )
+{
+int LIQM, LNIQM, LCIQM, LCNIQM;
+int dummy, i;
+	fprintf( stdout, "QuantMatrixExtension()\n" );
+	LIQM = GetBitStream( fp, 1 );
+	if( LIQM>0 )
+	{
+	    for( i=0; i<16; i++ )
+		dummy= GetBitStream( fp,  32 );
+	}
+	LNIQM = GetBitStream( fp, 1 );
+	if( LNIQM>0 )
+	{
+	    for( i=0; i<16; i++ )
+		dummy= GetBitStream( fp,  32 );
+	}
+	LCIQM = GetBitStream( fp, 1 );
+	if( LCIQM>0 )
+	{
+	    for( i=0; i<16; i++ )
+		dummy= GetBitStream( fp,  32 );
+	}
+	LCNIQM = GetBitStream( fp, 1 );
+	if( LCNIQM>0 )
+	{
+	    for( i=0; i<16; i++ )
+		dummy= GetBitStream( fp,  32 );
+	}
+	return 0;
+}
+
+int Extension( FILE *fp, unsigned char buffer[] )
+{
+int ESCI;
+ 	InitBitStream();
+	ESCI = GetBitStream( fp, 4 );
+	fprintf( stdout, "ESCI=%X\n", ESCI );
+	switch( ESCI )
+	{
+	case 1 :	// Sequence Extension
+	    SequenceExtension( fp, buffer );
+//	    fprintf( stdout, "\n" );
+	    break;
+	case 2 :	// Sequence Display Extension
+	    SequenceDisplayExtension( fp, buffer );
+	    break;
+	case 3 :	// Quant Matrix Extension
+	    QuantMatrixExtension( fp, buffer );
+	    break;
+	case 5 :	// Sequence Scalable Extension
+	    SequenceScalableExtension( fp, buffer );
+	    break;
+	case 8 :	// Picture Coding Extension
+	    PictureCodingExtention( fp, buffer );
+	    break;
+	case 7 :	// Picture Display Extension
+	    PictureDisplayExtension( fp, buffer );
+	    break;
+	case 9 :	// Picture Spatial Scalable Extension
+	case 10 :	// Picture Temporal Scalable Extension
+	default :
+	    fprintf( stdout, "Unknow ESCI(0x%02X)\n", ESCI );
+	    EXIT();
+	    break;
+	}
+	if( bDump )
+	fprintf( stdout, "%d bits readed\n", BitReaded );
+	return 0;
+}
+
+int GOP( FILE *fp, unsigned char buffer[] )
+{
+int TC, CG, BL;
+	if( bShow )
+	fprintf( stdout, "GOP()\n" );
+ 	InitBitStream();
+	TC   = GetBitStream( fp,25 );
+	CG   = GetBitStream( fp, 1 );
+	BL   = GetBitStream( fp, 1 );
+	if( bDump )
+	fprintf( stdout, "%d bits readed\n", BitReaded );
+	return 0;
+}
+
+int Picture( FILE *fp, unsigned char buffer[] )
+{
+int TR, PCT, VD, FPFV, FFC, FPBV, BFC, EBP, EIP;
+	if( bShow )
+	fprintf( stdout, "Picture() : " );
+ 	InitBitStream();
+//	bDebug=1;
+	TR   = GetBitStream( fp,10 );
+	PCT  = GetBitStream( fp, 3 );
+	VD   = GetBitStream( fp,16 );
+#if 0	// Not used with MPEG2
+	FPFV = GetBitStream( fp, 1 );
+	FFC  = GetBitStream( fp, 3 );
+	FPBV = GetBitStream( fp, 1 );
+	BFC  = GetBitStream( fp, 3 );
+#endif
+	EBP  = GetBitStream( fp, 1 );
+	EBP  = GetBitStream( fp, 1 );
+	while( EBP>0 )
+	{
+	    EIP  = GetBitStream( fp, 3 );
+	    EBP  = GetBitStream( fp, 1 );
+	}
+	fprintf( stdout, "PCT=%d\n", PCT );
+	if( bDump )
+	fprintf( stdout, "%d bits readed\n", BitReaded );
+//	bDebug=0;
+/*
+	PictureCodingExtention( fp, buffer );
+	QuantMatrixExtention( fp, buffer );
+	PictureDisplayExtention( fp, buffer );
+	PictureSpatialScalableExtention( fp, buffer );
+	PictureTemporalScalableExtention( fp, buffer );
+*/
+	return 0;
+}
+
+int SeekHeader( FILE *fp, unsigned char buffer[] )
+{
+int state=0;
+int readed;
+int total=0;
+	while( state<3 )
+	{
+	    readed = gread( buffer, 1, 1, fp );
+	    if( readed<1 )
+	    {
+		CannotRead( "(UserData)" );
+		return -1;
+	    }
+	    total+=1;
+	    switch( state )
+	    {
+	    case 0 :
+	    	if( buffer[0]==0x00 )
+		    state++;
+		break;
+	    case 1 :
+	    	if( buffer[0]==0x00 )
+		    state++;
+		else
+		    state = 0;
+		break;
+	    case 2 :
+	    	if( buffer[0]==0x01 )
+		    state++;
+		else
+		    state = 0;
+		break;
+	    }
+	}
+	return total;
+}
+
+int UserData( FILE *fp, unsigned char buffer[] )
+{
+int readed;
+int state=0;
+int total=0;
+	if( bShow )
+	fprintf( stdout, "UserData() : " );
+
+	total = SeekHeader( fp, buffer );
+	if( total<0 )
+	    return -1;
+
+	if( bDump )
+	fprintf( stdout, "%d bytes readed\n", total );
+	return 0;
+}
+
+// SSC : 00 00 01 AF
+int Slice( FILE *fp, unsigned char buffer[], int ID )
+{
+int readed;
+int total=0;
+int SVPE, PBP, QSC, ISF, IS, RB, EBS, EIS;
+int MBE;
+	if( bDumpSlice )
+	fprintf( stdout, "Slice(%02X) : %8X(%8X) : ", 
+		ID, g_addr, SrcAddr(g_addr) );
+
+ 	InitBitStream();
+#if 1
+//	bDebug = 1;
+#if 0
+	SVPE = GetBitStream( fp, 3 );
+	PBP  = GetBitStream( fp, 7 );
+	if( bDumpSlice )
+	{
+	fprintf( stdout, "SVPE=%d\n", SVPE );
+	fprintf( stdout, "PBP =%d\n", PBP  );
+	}
+#endif
+	QSC  = GetBitStream( fp, 5 );
+	ISF  = GetBitStream( fp, 1 );
+	if( bDumpSlice )
+	{
+	fprintf( stdout, "QSC =%d\n", QSC  );
+	fprintf( stdout, "ISF =%d\n", ISF  );
+	}
+	if( ISF>0 )
+	{
+	    IS   = GetBitStream( fp, 1 );	// Intra Slice Flag
+	    RB   = GetBitStream( fp, 7 );	// Reserved BIts
+	    if( bDumpSlice )
+	    {
+	    fprintf( stdout, "IS =%d\n", IS );
+	    fprintf( stdout, "RB =%d\n", RB );
+	    }
+	}
+	EBS=1;
+	while( EBS==1 )
+	{
+	    EBS  = GetBitStream( fp, 1 );
+	    EIS  = GetBitStream( fp, 8 );
+	    if( bDumpSlice )
+	    {
+	    fprintf( stdout, "EBS=%d\n", EBS );
+	    fprintf( stdout, "EIS=%d\n", EIS );
+	    }
+	}
+	MBE  = GetBitStream( fp, 11 );
+	if( bDumpSlice )
+	fprintf( stdout, "MBE=0x%X\n", MBE );
+
+//	bDebug = 0;
+
+	total = SeekHeader( fp, buffer );
+	if( total<0 )
+	    return -1;
+#else
+	total = SeekHeader( fp, buffer );
+	if( total<0 )
+	    return -1;
+#endif
+	if( bDumpSlice )
+	fprintf( stdout, "%d bytes readed\n", total );
+	return 3;
+}
+
+// -----------------------------------------------------
+
+void Usage( char *prg )
+{
+	fprintf( stdout, "%s filename\n", prg );
+	exit( 1 );
+}
+
+int CopyFile( FILE *infile, FILE *outfile, int size )
+{
+unsigned char buffer[BUF_SIZE];
+int bFull = 0;
+	if( size<0 )
+	    bFull = 1;
+	int rest = size;
+	while( (rest>0) || bFull )
+	{
+	    int readed, written;
+	    int copySize=0;
+	    if( bFull )
+	    	copySize = BUF_SIZE;
+	    else
+		copySize = (rest>BUF_SIZE) ? BUF_SIZE
+	    				   : rest;
+	    readed  = fread ( buffer, 1, copySize, infile );
+	    if( readed<1 )
+	    {
+	    	fprintf( stdout, "EOF\n" );
+		break;
+	    }
+	    written = fwrite( buffer, 1, readed, outfile );
+	    if( written<1 )
+	    {
+	    	fprintf( stdout, "Can't write(rest=%X)\n", rest );
+		return -1;
+	    }
+	    rest -= written;
+	}
+	return 0;
+}
+
+void swap( unsigned long *value1, unsigned long *value2 )
+{
+unsigned long tmp = *value1;
+	*value1 = *value2;
+	*value2 = tmp;
+}
+
+int bDebugUpdateBits = 1;
+int UpdateBits( unsigned char buffer[], int bitOffset, int size, int data )
+{
+int i;
+unsigned long inData, wrData, wrMask, outData;
+unsigned long MaskA[32];
+unsigned long MaskB[32];
+int nByte = (bitOffset+size+7)/8;
+
+	if( bDebugUpdateBits )
+	fprintf( stdout, "nByte=%d\n", nByte );
+	MaskA[1] = 0x80000000;
+	MaskB[1] = 0x00000001;
+	for( i=2; i<32; i++ )
+	{
+	    MaskA[i] = (MaskA[i-1]>>1) | 0x80000000;
+	    MaskB[i] = (MaskB[i-1]<<1) | 0x00000001;
+	}
+	inData = (buffer[0]<<24)
+	       | (buffer[1]<<16)
+	       | (buffer[2]<< 8)
+	       | (buffer[3]<< 0);
+	wrData = (data&MaskB[size])<<(32-bitOffset-size);
+	wrMask =       MaskA[size] >>bitOffset;
+	outData= inData & (wrMask^0xFFFFFFFF) | wrData;
+	unsigned long nOutData = outData;
+	for( i=0; i<nByte; i++ )
+	{
+	    buffer[i] = (nOutData>>24)&0xFF;
+	    if( bDebugUpdateBits )
+	    fprintf( stdout, "%08X %02X\n", nOutData, buffer[i] );
+	    nOutData=nOutData<<8;
+	}
+	fprintf( stdout, "UpdateBits(%d,%d,%d)\n", bitOffset, size, data );
+	fprintf( stdout, "inData =%8X\n", inData );
+	fprintf( stdout, "wrData =%8X\n", wrData );
+	fprintf( stdout, "wrMask =%8X\n", wrMask );
+	fprintf( stdout, "outData=%8X\n", outData );
+	if( bDebugUpdateBits )
+	{
+	    for( i=0; i<4; i++ )
+	    {
+		fprintf( stdout, "%02X ", buffer[i] );
+	    }
+	    fprintf( stdout, "\n" );
+	}
+	return 0;
+}
+
+int ReadByte( unsigned char *ptr, int addr, int bit )
+{
+	unsigned char *ubuffer = (unsigned char *)(ptr+(addr & 0x0FFF));
+	int byteOffset = bit/8;
+	unsigned char byte = ubuffer[byteOffset];
+	return byte;
+}
+int ReadBit( unsigned char *ptr, int addr, int bit )
+{
+	int bitOffset  = bit%8;
+	unsigned char byte = ReadByte( ptr, addr, bit );
+/*
+	fprintf( stdout, "ReadBit(%X,%d)=%02X,%d\n", 
+		addr, bit, byte, bitOffset );
+*/
+	if( byte & (1<<(7-bitOffset)) )
+	    return 1;
+	else
+	    return 0;
+}
+
+int WriteBit( unsigned char *ptr, int addr, int bit, int data )
+{
+	unsigned char *ubuffer = (unsigned char *)(ptr+(addr & 0x0FFF));
+	int byteOffset = bit/8;
+	int bitOffset  = bit%8;
+	unsigned char byte = ubuffer[byteOffset];
+	unsigned char Set  = (1<<(7-bitOffset));
+	unsigned char Mask = (1<<(7-bitOffset)) ^ 0xFF;
+	if( data )
+	    byte = byte | Set;
+	else
+	    byte = byte & Mask;
+	ubuffer[byteOffset] = byte;
+/*
+	fprintf( stdout, "WriteBit(%X,%d:%d) = %02X\n", 
+		addr, bit, data, byte );
+*/
+	return 0;
+}
+
+// ------------------------------------------------------------
+//	Analyze
+// ------------------------------------------------------------
+/*
+H.264
+NAL header = 0,nal_ref_idc[1:0], nal_unit_type[4:0]
+nal_unit_type =
+5 : IDR picutre slice
+6 : SEI
+7 : SPS
+8 : PPS
+9 : AU delimiter
+10 : End of Sequence
+11 : End of Stream
+12 : Filler data
+13 : Sequence Parameter Set Extrention
+14..18 : 
+19 : 
+20..23:
+24..31:
+*/
+int AnalyzeMPG( FILE *fp, FILE *pts_fp )
+{
+int bNoRead=0;
+int eof=0;
+unsigned char buffer[BUF_SIZE];
+int ID, len;
+int addr=0;
+int Error=0;
+int nItem = (-1);
+int readed, written;
+int i;
+unsigned long PTSH, PTSL, DTSH, DTSL;
+int readP=0;
+
+	while( eof==0 )
+	{
+#if 0
+	    if( bNoRead==0 )
+	    {
+		readed = gread( buffer, 1, 4, fp );
+		if( readed<4 )
+		{
+		    CannotRead( "Prefix" );
+		    break;
+		}
+	    }
+#else
+	    if( readP<4 )
+	    {
+	    	int size;
+	    	size = 4-readP;
+#if 0
+		fprintf( stdout, "gread@%d, %d\n", readP, size );
+#endif
+		readed = gread( &buffer[readP], 1, size, fp );
+		if( readed<size )
+		{
+		    CannotRead( "Prefix" );
+		    break;
+		}
+		readP+=size;
+	    }
+#endif
+	    if( (buffer[0]==0x00)
+	     && (buffer[1]==0x00)
+	     && (buffer[2]==0x00) )
+	    {
+#if 0
+		if ( buffer[3]==1 )
+		{
+		    fprintf( stdout, "File may be AVC ?  Add -AVC option\n" );
+		    EXIT();
+		}
+#endif
+	    fprintf( stdout, "00 00 00 : %X\n", g_addr );
+	    	memcpy( &buffer[0], &buffer[1], 3 );
+		readed = gread( &buffer[3], 1, 1, fp );
+		if( readed<1 )
+		{
+		    CannotRead( "Prefix" );
+		    break;
+		}
+		continue;
+	    }
+
+	    if( (buffer[0]!=0x00)
+	     || (buffer[1]!=0x00)
+	     || (buffer[2]!=0x01) )
+	    {
+	    	if( (buffer[0]==0)
+		 && (buffer[1]==0)
+		 && (buffer[2]==0)
+		 && (buffer[3]==1) )
+		{
+		    fprintf( stdout, "File may be AVC ?  Add -AVC option\n" );
+		    EXIT();
+		}
+	    	fprintf( stdout, "Invalid Prefix %02X %02X %02X : @%X(%X)\n",
+			buffer[0], buffer[1], buffer[2], g_addr-4,
+			SrcAddr(g_addr-4) );
+		while( 1 )
+		{
+		    memcpy( &buffer[0], &buffer[1], 3 );
+		    readed = gread( &buffer[3], 1, 1, fp );
+		    if( readed<1 )
+		    {
+		    	fprintf( stdout, "EOF\n" );
+			EXIT();
+		    }
+		    if( (buffer[0]==0)
+		     && (buffer[1]==0)
+		     && (buffer[2]==1) )
+		     {
+		     	fprintf( stdout, "00 00 01 : %X\n", g_addr );
+		     	break;
+		     }
+		}
+	    }
+	    // 00 00 01 XX(ID)
+	    ID = buffer[3];
+	    if( (ID>=0xB0) || bDumpSlice )
+	    {
+		if( bShow )
+		{
+		    for( i=0; i<4; i++ )
+		    {
+			fprintf( stdout, "%02X ", buffer[i] );
+		    }
+		    fprintf( stdout, ": " );
+		    fprintf( stdout, "\n" );
+		}
+    //	    fprintf( stdout, "ID = %02X\n", ID );
+	    }
+
+	    readP = 0;
+
+	    if( (ID>=1) && (ID<=0xAF) )
+	    {
+		    readP =  Slice( fp, buffer, ID );
+		    if( readP<0 )
+		    {
+		    	eof=1;
+			break;
+		    }
+		    buffer[0] = 0x00;
+		    buffer[1] = 0x00;
+		    buffer[2] = 0x01;
+		    readed = gread( &buffer[3], 1, 1, fp );
+		    readP = 4;
+		    bNoRead=1;
+	    } else {
+		if( bShow )
+	    	if( bNoRead )
+		{
+		    fprintf( stdout, "%02X %02X %02X %02X : ",
+			buffer[0], buffer[1], buffer[2], buffer[3] );
+		    fprintf( stdout, "\n" );
+		}
+		bNoRead=0;
+		int pes_len=(-1);
+		switch( ID )
+		{
+		case 0xE0 :	// 
+		    pes_len = PES_header( fp, buffer, bDisplayTS, 
+		    	PTSH, PTSL, DTSH, DTSL );
+		    fprintf( pts_fp, "%8X %8X : %4X %08X, %4X %08X\n",
+			    g_addr, SrcAddr(g_addr),
+			    PTSH, PTSL, DTSH & 0xFFFF, DTSL );
+		    break;
+		case 0xB2 :
+		    if( UserData( fp, buffer )<0 )
+		    {
+		    	eof=1;
+		    	break;
+		    }
+		    buffer[0] = 0x00;
+		    buffer[1] = 0x00;
+		    buffer[2] = 0x01;
+		    readed = gread( &buffer[3], 1, 1, fp );
+		    bNoRead=1;
+		    readP = 4;
+		    break;
+		case 0xB3 :	// SHC
+		    Sequence( fp, buffer );
+		    break;
+		case 0xB5 :	// ESC
+		    Extension( fp, buffer );
+		    break;
+		case 0xB8 :	// GSC
+		    GOP( fp, buffer );
+		    break;
+		case 0x00 :	// PSC
+		    Picture( fp, buffer );
+		    break;
+		case 0xAF :	// SSC
+		    break;
+		case 0xC0 :	// Audio
+		    {
+		    int a0 = g_addr;
+		    pes_len = PES_header( fp, buffer, bDisplayTS, 
+		    	PTSH, PTSL, DTSH, DTSL );
+		    fprintf( pts_fp, "%8X %8X : %4X %08X, %4X %08X\n",
+			    g_addr, SrcAddr(g_addr),
+			    PTSH, PTSL, DTSH & 0xFFFF, DTSL );
+		    int a1 = g_addr;
+		    int readSize = pes_len-(a1-a0)+2;
+#if 0
+		    fprintf( stdout, "pes_len=%d, a1-a0=%d, read=%d\n",
+		    	pes_len, a1-a0, readSize );
+#endif
+		    if( readSize>=MAX_DATA_SIZE )
+		    {
+		    	fprintf( stdout, "Too large data (0x%X)\n",
+				readSize );
+			exit( 1 );
+		    }
+		    readed = gread( dataBuf, 1, readSize, fp );
+		    }
+		    break;
+		default :
+		    fprintf( stdout, 
+		    	"Not implemented (%02X) in AnaylzeMPG(%8X:%8X)\n",
+			    ID, g_addr, SrcAddr(g_addr) );
+		    break;
+		}
+	    }
+	}
+	fprintf( stdout, "nSequence=%d\n", nSequence );
+	fprintf( stdout, "nSequenceExtension=%d\n", nSequenceExtension );
+	fprintf( stdout, "nSequenceDisplayExtension=%d\n", 
+		nSequenceDisplayExtension );
+	fprintf( stdout, "addr=%X\n", g_update_addr[0] );
+	fprintf( stdout, "bits=%X\n", g_update_bits[0] );
+	fprintf( stdout, "size=%X\n", g_update_size[0] );
+	fprintf( stdout, "data=%X\n", g_update_data[0] );
+	return 0;
+}
+
+void ShowHeader( unsigned char *buffer )
+{
+int i;
+	for( i=0; i<4; i++ )
+	{
+	    fprintf( stdout, "%02X ", buffer[i] );
+	}
+	fprintf( stdout, " : %8X(%8X) : ", g_addr, SrcAddr(g_addr) );
+}
+
+int nPict=0;
+int nPes=0;
+int oPes=(-1);
+int nShc=0;
+
+int Header( FILE *fp, unsigned char *buffer, FILE *pts_fp )
+{
+int i;
+int ID=buffer[3];
+unsigned long PTSH=0xFFFFFFFF, PTSL=0xFFFFFFFF;
+unsigned long DTSH=0xFFFFFFFF, DTSL=0xFFFFFFFF;
+	if( ID<0x80 )
+	{
+	    if( ID==0 )
+	    {
+	    	int TR, PCT;
+		ShowHeader( buffer );
+		InitBitStream( );
+		TR  = GetBitStream( fp, 10 );
+		PCT = GetBitStream( fp, 3 );
+		fprintf( stdout, "TR=%4d, PCT=%d : Pict(%4d)\n", 
+			TR, PCT, nPict );
+		if( (PCT>=1) && (PCT<=3) )
+		{
+		    nPict++;
+		} else {
+		    fprintf( stdout, "Error\n" );
+		    int RST= GetBitStream( fp, 3 );
+		    buffer[4] = TR>>2;
+		    buffer[5] = ((TR&3)<<6) 
+		    	       | (PCT<<3)
+			       | (RST<<0);
+		    return 2;
+		}
+	    } else {
+	    	if( oPes!=nPes )
+		{
+		    ShowHeader( buffer );
+		    fprintf( stdout, "\n" );
+		}
+		oPes=nPes;
+	    }
+	} else {
+	    ShowHeader( buffer );
+	    oPes=nPes;
+	    switch( ID )
+	    {
+	    case 0xE0 :	// PES_header
+		PES_header( fp, buffer, 0, PTSH, PTSL, DTSH, DTSL );
+		if( PTSH!=0xFFFFFFFF )
+		    fprintf( stdout, "PTS=%4X %6X ", PTSH, PTSL );
+		if( DTSH!=0xFFFFFFFF )
+		    fprintf( stdout, "DTS=%4X %6X", DTSH, DTSL );
+		fprintf( stdout, ": Pes(%4d)", nPes );
+		fprintf( pts_fp, "%8X %8X : %4X %08X, %4X %08X\n",
+			g_addr, SrcAddr(g_addr),
+			PTSH, PTSL, DTSH & 0xFFFF, DTSL );
+		nPes++;
+		break;
+	    case 0xB2 :	// UserData
+	    	fprintf( stdout, "UserData" );
+		break;
+	    case 0xB3 :	// SHC
+	    	fprintf( stdout, "SHC (%4d)", nShc );
+		nShc++;
+		break;
+	    case 0xB5 :	// ESC
+	    	fprintf( stdout, "ESC" );
+		break;
+	    case 0xB8 :	// GSC
+	    	fprintf( stdout, "GSC" );
+		break;
+	    case 0x00 :	// PSC
+	    	fprintf( stdout, "PSC" );
+		break;
+	    default :
+		fprintf( stdout, 
+		    "Not implemented (%02X) in Header\n", ID );
+		break;
+	    }
+	    fprintf( stdout, "\n" );
+	}
+	return 0;
+}
+
+int AnalyzeHeader( FILE *fp, FILE *pts_fp )
+{
+int eof=0;
+unsigned char buffer[BUF_SIZE];
+int ID, len;
+int addr=0;
+int Error=0;
+int nItem = (-1);
+int readed, written;
+int i;
+int nPos=0;
+int ret=0;
+	nPict=0;
+	nPes =0;
+	nShc =0;
+
+	while( eof==0 )
+	{
+	    readed = gread( &buffer[nPos], 1, 1, fp );
+	    if( readed<1 )
+	    {
+		fprintf( stdout, "EOF@%X(%X)\n", g_addr, SrcAddr(g_addr) );
+		break;
+	    }
+	    switch( nPos )
+	    {
+	    case 0 :
+		if( buffer[nPos]==0 )	// 00
+		    nPos++;
+		break;
+	    case 1 :
+		if( buffer[nPos]==0 )	// 00 00
+		    nPos++;
+		else
+		    nPos=0;
+		break;
+	    case 2 :
+		if( buffer[nPos]==0 )	// 00 00 00
+		{
+		} else if( buffer[nPos]==1 )	// 00 00 01
+		    nPos++;
+		else
+		    nPos=0;
+		break;
+	    case 3 :
+	    	ID = buffer[nPos];
+		ret = Header( fp, buffer, pts_fp );
+		if( ret>0 )	// Error
+		{
+		    buffer[0] = buffer[0+ret];
+		    buffer[1] = buffer[1+ret];
+		    buffer[2] = buffer[2+ret];
+		    buffer[3] = buffer[3+ret];
+		    if( buffer[1]==0 )
+		    {
+		    	if( buffer[2]==0 )
+			{
+			    if( buffer[3]==1 )
+			    	nPos=3;
+			    else
+			    	nPos=0;
+			} else {
+			    	nPos=0;
+			}
+		    } else if( buffer[2]==0 )
+		    {
+		    	if( buffer[3]==0 )
+			    nPos=2;
+			else
+			    nPos=0;
+		    } else if( buffer[3]==0 )
+		    	nPos=1;
+		    else
+		    	nPos=0;
+		    fprintf( stdout, "%02X %02X %02X %02X\n",
+		    	buffer[0],
+		    	buffer[1],
+		    	buffer[2],
+		    	buffer[3] );
+		} else {
+		    nPos=0;
+		}
+		break;
+	    }
+	}
+	return 0;
+}
+
+// ------------------------------------------------------------
+int skipContent( FILE *fp, unsigned char *buffer, int bDump )
+{
+int i;
+int zCount=0;
+int readed;
+	if( bShowDetail )
+	{
+	fprintf( stdout, "***********************************************\n" );
+	fprintf( stdout, " skipContent(%X)\n", g_addr );
+	fprintf( stdout, "***********************************************\n" );
+	}
+	while( 1 )
+	{
+	    readed = gread( &buffer[zCount], 1, 1, fp );
+	    if( readed<1 )
+	    {
+	    	CannotRead( NULL );
+	    	return -1;
+	    }
+	    if( bDump )
+	    {
+	    	for( i=0; i<readed; i++ )
+		{
+		    fprintf( stdout, "%02X ", buffer[zCount+i] );
+		}
+	    }
+	    switch( zCount )
+	    {
+	    case 0 :
+	    	if( buffer[zCount]==0 )
+		    zCount++;
+		break;
+	    case 1 :	// 00 XX
+	    	if( buffer[zCount]==0 )
+		    zCount++;
+		else
+		    zCount=0;
+		break;
+	    case 2 :	// 00 00 XX
+	    	if( buffer[zCount]==0 )	// 00 00 00
+		{
+			// Do nothing
+		} else if( buffer[zCount]==1 ) {	// 00 00 01
+//		    fprintf( stdout, "Found\n" );
+		    readed = gread( &buffer[3], 1, 1, fp );
+		    if( readed<1 )
+		    {
+			CannotRead( NULL );
+			return -1;
+		    }
+		    if( bDump )
+			fprintf( stdout, "%02X\n", buffer[3] );
+		    if( bShowDetail )
+		    fprintf( stdout, "skipped(%X(%X))\n", 
+		    	g_addr, SrcAddr(g_addr) );
+		    return 1;
+		} else {	// 00 00 XX
+		    zCount = 0;
+		}
+		break;
+	    }
+	}
+	if( bDebug )
+	    fprintf( stdout, "%X\n", g_addr );
+	return 0;
+}
+
+int hrd_parameters( FILE *fp, unsigned char *buffer )
+{
+int n;
+int bit_rate_scale = (-1);
+int cpb_size_scale = (-1);
+int bit_rate_value[256];
+int cpb_size_value[256];
+int cbr_flag[256];
+	fprintf( stdout, "hrd_parameters()\n" );
+	for( n=0; n<256; n++ )
+	{
+	    bit_rate_value[n] =  (-1);
+	    cpb_size_value[n] =  (-1);
+	    cbr_flag[n]       =  (-1);
+	}
+	// -----------------------------------------
+	avc_cpb_cnt = GetBitStreamGolomb( fp );
+	bit_rate_scale = GetBitStream( fp, 4 );
+	cpb_size_scale = GetBitStream( fp, 4 );
+	if( bShowDetail )
+	fprintf( stdout, "cpb_cnt=%d\n", avc_cpb_cnt );
+	if( bShowDetail )
+	fprintf( stdout, "bit_rate_scale=%d\n", bit_rate_scale );
+	if( bShowDetail )
+	fprintf( stdout, "cpb_size_scale=%d\n", cpb_size_scale );
+	for( n=0; n<=avc_cpb_cnt; n++ )
+	{
+	    bit_rate_value[n] = GetBitStreamGolomb( fp );
+	    if( bShowDetail )
+	    fprintf( stdout, "bit_rate_value[%d]=%d\n", n, bit_rate_value[n] );
+	    cpb_size_value[n] = GetBitStreamGolomb( fp );
+	    if( bShowDetail )
+	    fprintf( stdout, "cpb_size_value[%d]=%d\n", n, cpb_size_value[n] );
+	    cbr_flag[n] = GetBitStream( fp, 1 );
+	    if( bShowDetail )
+	    fprintf( stdout, "cbr_flag      [%d]=%d\n", n, cbr_flag[n] );
+	}
+	avc_initial_cpb_removal_delay_length = GetBitStream( fp, 5 )+1;
+	avc_cpb_removal_delay_length = GetBitStream( fp, 5 )+1;
+	avc_dpb_output_delay_length = GetBitStream( fp, 5 )+1;
+	if( bShowDetail )
+	fprintf( stdout, "initial_cpb_removal_delay_length=%d\n",
+		avc_initial_cpb_removal_delay_length );
+	if( bShowDetail )
+	fprintf( stdout, "cpb_removal_delay_length=%d\n",
+		avc_cpb_removal_delay_length );
+	if( bShowDetail )
+	fprintf( stdout, "dpb_output_delay_length=%d\n",
+		avc_dpb_output_delay_length );
+#if 1	// 2011.9.23
+	avc_CpbDpbDelaysPresentFlag = 1;
+	if( bShowDetail )
+	fprintf( stdout, "avc_CpbDpbDelaysPresentFlag is set to 1\n" );;
+#endif
+	avc_time_offset_length = GetBitStream( fp, 5 );
+	if( bShowDetail )
+	fprintf( stdout, "time_offset_length=%d\n", avc_time_offset_length );
+	return 0;
+}
+
+#define EXTENDED_SAR	255
+
+#define EDIT_NONE	0
+#define EDIT_CUT	1
+#define EDIT_INS	2
+static int bEditSPS=EDIT_NONE;
+
+int vui_parameters( FILE *fp, unsigned char *buffer )
+{
+int aspect_ratio_info_present_flag = (-1);
+int aspect_ratio = (-1);
+int sar_width  = (-1);
+int sar_height = (-1);
+int overscan_info_present_flag = (-1);
+int overscan_info = (-1);
+int video_signal_type_present_flag = (-1);
+int video_format = (-1);
+int video_full_range_flag = (-1);
+int colour_description_present_flag = (-1);
+int transfer_characteristics = (-1);
+int colour_primaries = (-1);
+int matrix_coefficients = (-1);
+int chroma_loc_info_present_flag = (-1);
+int chroma_sample_loc_type_top_field = (-1);
+int chroma_sample_loc_type_bottom_field = (-1);
+int timing_info_present_flag = (-1);
+int num_units_in_tick = (-1);
+int time_scale = (-1);
+int fixed_frame_rate_flag = (-1);
+int low_delay_hrd_flag = (-1);
+int bitstream_restriction_flag = (-1);
+int motion_ectors_over_pic_boundaries_flag = (-1);
+int max_bytes_per_pic_denom = (-1);
+int max_bits_per_pic_denom = (-1);
+int max_mv_length_horizontal = (-1);
+int max_mv_length_vertical = (-1);
+int num_reorder_frames = (-1);
+int max_dec_frame_buffering = (-1);
+	// -----------------------------------------------------
+	avc_nal_hrd_parameters_present_flag = (-1);
+	avc_vcl_hrd_parameters_present_flag = (-1);
+	avc_pic_struct_present_flag = (-1);
+	avc_CpbDpbDelaysPresentFlag = (-1);
+	// -----------------------------------------------------
+	fprintf( stdout, "vui_parameters()\n" );
+	if( bRemoveTimingInfo )
+	    fprintf( stdout, "bRemoveTimingInfo=%d\n", bRemoveTimingInfo );
+	aspect_ratio_info_present_flag = GetBitStream( fp, 1 );
+	if( bShowDetail )
+	fprintf( stdout, "aspect_ratio_info=%d\n", 
+		aspect_ratio_info_present_flag );
+	if( aspect_ratio_info_present_flag )
+	{
+	    aspect_ratio = GetBitStream( fp, 8 );
+	    if( bShowDetail )
+	    fprintf( stdout, "aspect_ratio=%d\n", aspect_ratio );
+	    if( aspect_ratio==EXTENDED_SAR )
+	    {
+		//
+		UpdateProcedure( n_vui_parameters, ID_SARW, 16 );
+		//
+	    	sar_width  = GetBitStream( fp, 16 );
+		//
+		UpdateProcedure( n_vui_parameters, ID_SARH, 16 );
+		//
+	    	sar_height = GetBitStream( fp, 16 );
+		if( bShowDetail )
+		fprintf( stdout, "sar_width=%d\n", sar_width );
+		if( bShowDetail )
+		fprintf( stdout, "sar_height=%d\n", sar_height );
+	    }
+	}
+	int bEditOVS=0;
+	int bUpdateOVS=UpdateProcedure( n_vui_parameters, ID_OVSP, 1 );
+	overscan_info_present_flag = GetBitStream( fp, 1 );
+	if( bShowDetail )
+	fprintf( stdout, "overscan_info_present=%d\n", 
+		overscan_info_present_flag );
+	if( bUpdateOVS )
+	{
+	    if( bShowDetail )
+	    fprintf( stdout, "ovs(%d->%d)\n", 
+		    overscan_info_present_flag, value[ID_OVSP] );
+	    if( overscan_info_present_flag==1 )
+	    {
+		if( value[ID_OVSP]==0 )
+		{
+		    bEditOVS=1;
+		    bEditSPS=EDIT_CUT;
+		    SpecialStartAddr = BitAddr;
+		    SpecialStartBits = BitOffset;
+		    fprintf( stdout, "bEditSPS=%d\n", bEditSPS );
+		}
+	    } else {
+		if( value[ID_OVSP]==1 )	// add OVS
+		{
+		    bEditOVS=1;
+		    bEditSPS=EDIT_INS;
+		    SpecialStartAddr = BitAddr;
+		    SpecialStartBits = BitOffset;
+		    fprintf( stdout, "bEditSPS=%d\n", bEditSPS );
+		}
+	    }
+	}
+
+	if( overscan_info_present_flag )
+	{
+	    fprintf( stdout, "ovs:BitAddr=%X(%X), BitOffset=%d\n",
+	    	BitAddr, SrcAddr(BitAddr), BitOffset );
+	    UpdateProcedure( n_vui_parameters, ID_OVSA, 1 );
+	    overscan_info = GetBitStream( fp, 1 );
+	    if( bShowDetail )
+	    fprintf( stdout, "overscan_info_appropriate_flag=%d\n", 
+	    	overscan_info );
+	}
+	if( bEditOVS )
+	{
+	    SpecialEndAddr = BitAddr;
+	    SpecialEndBits = BitOffset;
+	}
+
+	video_signal_type_present_flag = GetBitStream( fp, 1 );
+	if( bShowDetail )
+	fprintf( stdout, "video_signal_type_present=%d\n", 
+	    video_signal_type_present_flag );
+	if( video_signal_type_present_flag )
+	{
+	    video_format = GetBitStream( fp, 3 );
+	    if( bShowDetail )
+	    fprintf( stdout, "video_format=%d\n", video_format );
+	    video_full_range_flag = GetBitStream( fp, 1 );
+	    if( bShowDetail )
+	    fprintf( stdout, "video_full_range=%d\n", video_full_range_flag );
+	    colour_description_present_flag = GetBitStream( fp, 1 );
+	    if( bShowDetail )
+	    fprintf( stdout, "colour_description_present=%d\n", 
+	    	colour_description_present_flag );
+	    if( colour_description_present_flag )
+	    {
+		//
+		UpdateProcedure( n_vui_parameters, ID_CP,  8 );
+		//
+		colour_primaries = GetBitStream( fp, 8 );
+	    if( bShowDetail )
+		fprintf( stdout, "colour_primaries=%d\n", colour_primaries );
+		//
+		UpdateProcedure( n_vui_parameters, ID_TC,  8 );
+		//
+		transfer_characteristics = GetBitStream( fp, 8 );
+	    if( bShowDetail )
+		fprintf( stdout, "transfer_characteristics=%d\n", 
+			transfer_characteristics );
+		//
+		UpdateProcedure( n_vui_parameters, ID_MXC,  8 );
+		//
+		matrix_coefficients = GetBitStream( fp, 8 );
+	    if( bShowDetail )
+		fprintf( stdout, "matrix_coefficients=%d\n", 
+			matrix_coefficients );
+	    }
+	}
+	chroma_loc_info_present_flag = GetBitStream( fp, 1 );
+	if( bShowDetail )
+	fprintf( stdout, "chroma_loc_info_present=%d\n", 
+	    chroma_loc_info_present_flag );
+	if( chroma_loc_info_present_flag )
+	{
+	    chroma_sample_loc_type_top_field = GetBitStreamGolomb( fp );
+	    chroma_sample_loc_type_bottom_field = GetBitStreamGolomb( fp );
+	}
+
+	if( bRemoveTimingInfo )
+	{	// make timing_info_present_flag = 0
+	    DoUpdate( BitAddr, BitOffset, 1, 0 );
+	}
+	timing_info_present_flag = GetBitStream( fp, 1 );
+	if( bShowDetail )
+	fprintf( stdout, "timing_info_present=%d\n", timing_info_present_flag );
+	if( timing_info_present_flag==1 )
+	{
+	    if( bRemoveTimingInfo )
+	    {
+		bEditSPS = EDIT_CUT;
+		SpecialStartAddr = BitAddr;
+		SpecialStartBits = BitOffset;
+		ShowBitAddr( );
+	    }
+//
+	    num_units_in_tick = GetBitStream( fp, 32 );
+	    if( bShowDetail )
+	    fprintf( stdout, "num_units_in_tick=%d\n", num_units_in_tick );
+	    time_scale = GetBitStream( fp, 32 );
+	    if( bShowDetail )
+	    fprintf( stdout, "time_scale=%d\n", time_scale );
+	    //
+	    UpdateProcedure( n_vui_parameters, ID_FRC,  1 );
+	    //
+	    fixed_frame_rate_flag = GetBitStream( fp, 1 );
+	    if( bShowDetail )
+	    fprintf( stdout, "fixed_frame_rate_flag=%d\n", 
+		    fixed_frame_rate_flag );
+//
+	    if( bRemoveTimingInfo )
+	    if( bEditSPS )
+	    {
+		ShowBitAddr( );
+	    }
+//
+	}
+	if( bRemoveTimingInfo )
+	{
+	    SpecialEndAddr = BitAddr;
+	    SpecialEndBits = BitOffset;
+	}
+	avc_nal_hrd_parameters_present_flag = GetBitStream( fp, 1 );
+	if( bShowDetail )
+	fprintf( stdout, "nal_hrd_parameters_present=%d\n", 
+		avc_nal_hrd_parameters_present_flag );
+	if( avc_nal_hrd_parameters_present_flag==1 )
+	{
+	    hrd_parameters( fp, buffer );
+	}
+	avc_vcl_hrd_parameters_present_flag = GetBitStream( fp, 1 );
+	if( bShowDetail )
+	fprintf( stdout, "vcl_hrd_parameters_present=%d\n", 
+		avc_vcl_hrd_parameters_present_flag );
+	if( avc_vcl_hrd_parameters_present_flag==1 )
+	{
+	    hrd_parameters( fp, buffer );
+	}
+	if( avc_nal_hrd_parameters_present_flag 
+	 || avc_vcl_hrd_parameters_present_flag )
+	    low_delay_hrd_flag = GetBitStream( fp, 1 );
+	avc_pic_struct_present_flag = GetBitStream( fp, 1 );
+	if( bShowDetail )
+	fprintf( stdout, "pic_struct_present_flag=%d\n", 
+		avc_pic_struct_present_flag );
+	bitstream_restriction_flag = GetBitStream( fp, 1 );
+	if( bShowDetail )
+	fprintf( stdout, "bitstream_restriction_flag=%d\n", 
+		bitstream_restriction_flag );
+	if( bitstream_restriction_flag==1 )
+	{
+	    motion_ectors_over_pic_boundaries_flag = GetBitStream( fp, 1 );
+	    max_bytes_per_pic_denom = GetBitStreamGolomb( fp );
+	    max_bits_per_pic_denom = GetBitStreamGolomb( fp );
+	    max_mv_length_horizontal = GetBitStreamGolomb( fp );
+	    max_mv_length_vertical = GetBitStreamGolomb( fp );
+	    num_reorder_frames = GetBitStreamGolomb( fp );
+	    max_dec_frame_buffering = GetBitStreamGolomb( fp );
+	}
+	n_vui_parameters ++;
+	return 0;
+}
+
+int SequenceParameterSet( FILE *fp, unsigned char *buffer )
+{
+int n;
+int profile_idc=(-1);
+int constraint=(-1);
+int level_idc=(-1);
+int seq_parameter_set_id=(-1);
+int chroma_format_idc=(-1);
+int bit_depth_luma=(-1);
+int bit_depth_chroma=(-1);
+int bypass_flag = (-1);
+int matrix_present_flag = (-1);
+int max_frame_num = (-1);
+int pic_order_cnt_type = (-1);
+int max_pic_order_cnt_lsb = (-1);
+int pic_order_always_zero_flag  = (-1);
+int offset_for_non_ref  = (-1);
+int offset_for_top_for_bottom  = (-1);
+int num_ref_frames  = (-1);
+int offset_for_ref_frame[256];
+int max_num_ref_frames  = (-1);
+int gaps_allowed_flag = (-1);
+int pic_width   = (-1);
+int pic_height  = (-1);
+int adaptive_frame_field_flag = (-1);
+int direct_8x8_inference_flag = (-1);
+int frame_cropping_flag = (-1);
+int frame_crop_left_offset   = (-1);
+int frame_crop_right_offset  = (-1);
+int frame_crop_top_offset    = (-1);
+int frame_crop_bottom_offset = (-1);
+int vui_parameters_present_flag = (-1);
+int ret=0;
+
+//	bDebugGol = 1;
+	bEditSPS = EDIT_NONE;
+	for( n=0; n<256; n++  )
+	{
+	    offset_for_ref_frame[n] = (-1);
+	}
+	// -------------------------------------------
+	InitBitStream( );
+	bDebugGolB = bDebugGol;
+	//
+	UpdateProcedure( n_sequenceParameters, ID_PALI,  8 );
+	//
+	profile_idc = GetBitStream( fp, 8 );
+	if( bShowDetail )
+	fprintf( stdout, "profile=%d\n", profile_idc );
+	constraint  = GetBitStream( fp, 8 );
+	if( bShowDetail )
+	fprintf( stdout, "constraint=%d\n", constraint );
+	//
+	UpdateProcedure( n_sequenceParameters, ID_LVL,  8 );
+	//
+	level_idc   = GetBitStream( fp, 8 );
+	if( bShowDetail )
+	fprintf( stdout, "level=%d\n", level_idc );
+	seq_parameter_set_id = GetBitStreamGolomb( fp );
+	switch( profile_idc )
+	{
+	case 100 :
+	case 110 :
+	case 122 :
+	case 244 :
+	case  44 :
+	case  83 :
+	case  86 :
+	case 118 :
+	case 128 :
+	    chroma_format_idc = GetBitStreamGolomb( fp );
+	    if( bShowDetail )
+	    fprintf( stdout, "chroma_format=%d\n", chroma_format_idc );
+	    if( chroma_format_idc==3 )
+	    {
+	    	avc_separate_colour_plane_flag = GetBitStream( fp, 1 );
+	    }
+	    bit_depth_luma = GetBitStreamGolomb( fp );
+	    bit_depth_chroma = GetBitStreamGolomb( fp );
+	    if( bShowDetail )
+	    fprintf( stdout, "bit_depth_luma  =%d\n", bit_depth_luma );
+	    if( bShowDetail )
+	    fprintf( stdout, "bit_depth_chroma=%d\n", bit_depth_chroma );
+	    bypass_flag = GetBitStream( fp, 1 );
+	    if( bShowDetail )
+	    fprintf( stdout, "bypass_flag=%d\n", bypass_flag );
+	    matrix_present_flag = GetBitStream( fp, 1 );
+	    if( bShowDetail )
+	    fprintf( stdout, "scaling_matrix_flag=%d\n", matrix_present_flag );
+	    if( matrix_present_flag )
+	    {
+	    	int i;
+	    	int n = chroma_format_idc!=3 ? 8 : 12;
+		if( bShowDetail )
+	    	fprintf( stdout, "matrix_present(%d)\n", n );
+	    	for( i=0; i<n; i++ )
+		{
+		    int seq_scaling_list_present_flag;
+		    seq_scaling_list_present_flag  = GetBitStream( fp, 1 );
+		    if( seq_scaling_list_present_flag )
+		    {
+		    }
+		}
+		if( bShowDetail )
+		fprintf( stdout, "matrix_present_flag : under construction\n" );
+		EXIT();
+	    }
+	    break;
+	}
+	max_frame_num = GetBitStreamGolomb( fp );
+	if( bShowDetail )
+	fprintf( stdout, "max_frame_num=%d\n", max_frame_num );
+	pic_order_cnt_type = GetBitStreamGolomb( fp );
+	if( bShowDetail )
+	fprintf( stdout, "pic_order_cnt_type=%d\n", pic_order_cnt_type );
+	if( pic_order_cnt_type==0 )
+	{
+	    max_pic_order_cnt_lsb = GetBitStreamGolomb( fp );
+	if( bShowDetail )
+	fprintf( stdout, "max_pic_order_cnt_lsb=%d\n", max_pic_order_cnt_lsb );
+	} else if( pic_order_cnt_type==1 )
+	{
+	    pic_order_always_zero_flag  = GetBitStream( fp, 1 );
+	    offset_for_non_ref  = GetBitStreamGolomb( fp );
+	    offset_for_top_for_bottom  = GetBitStreamGolomb( fp );
+	    num_ref_frames  = GetBitStreamGolomb( fp );
+	    if( bShowDetail )
+	    fprintf( stdout, "offset_for_top_for_bottom=%d\n", 
+	    	offset_for_top_for_bottom );
+	    if( bShowDetail )
+	    fprintf( stdout, "num_ref_frames=%d\n", num_ref_frames );
+	    for( n=0; n<num_ref_frames; n++ )
+	    {
+		offset_for_ref_frame[n]  = GetBitStreamGolomb( fp );
+	    }
+	}
+	max_num_ref_frames  = GetBitStreamGolomb( fp );
+	if( bShowDetail )
+	fprintf( stdout, "max_num_ref_frames=%d\n", max_num_ref_frames );
+	gaps_allowed_flag = GetBitStream( fp, 1 );
+	int pic_width_in_mbs_minus1        ;
+	int pic_height_in_map_units_minus1 ;
+	//
+#if 1
+	if( bShowDetail )
+	fprintf( stdout, 
+	"pic_width_in_mbs_minus1 at (0x%X,%d),(0x%X,%d),(0x%X)\n", 
+		BitAddr, BitOffset, BitAddr+BitOffset/8, BitOffset%8,
+		SrcAddr(BitAddr+BitOffset/8) );
+#endif
+	int BitSt = BitOffset;
+	pic_width_in_mbs_minus1        = GetBitStreamGolomb( fp );
+	UpdateProcedureGolomb( n_sequenceParameters, ID_HSV, BitOffset-BitSt,
+		GolombValue(GolombNext(pic_width_in_mbs_minus1,1)) );
+	///
+	BitSt = BitOffset;
+	pic_height_in_map_units_minus1 = GetBitStreamGolomb( fp );
+	UpdateProcedureGolomb( n_sequenceParameters, ID_VSV, BitOffset-BitSt,
+		GolombValue(GolombNext(pic_width_in_mbs_minus1,1)) );
+	//
+	pic_width = (pic_width_in_mbs_minus1+1)*16;
+	pic_height= (pic_height_in_map_units_minus1+1);
+	if( bShowDetail )
+	fprintf( stdout, "pic_width =%d\n", pic_width );
+	if( bShowDetail )
+	fprintf( stdout, "pic_height=%d (%d)\n", pic_height, pic_height*16 );
+	avc_frame_mbs_only_flag = GetBitStream( fp, 1 );
+	if( bShowDetail )
+	fprintf( stdout, "frame_mbs_only_flag=%d\n", avc_frame_mbs_only_flag );
+	if( avc_frame_mbs_only_flag==0 )
+	{
+	    adaptive_frame_field_flag = GetBitStream( fp, 1 );
+	}
+	direct_8x8_inference_flag = GetBitStream( fp, 1 );
+	if( bShowDetail )
+	fprintf( stdout, "direct_8x8=%d\n", direct_8x8_inference_flag );
+	frame_cropping_flag = GetBitStream( fp, 1 );
+	if( bShowDetail )
+	fprintf( stdout, "cropping=%d\n", frame_cropping_flag );
+	if( frame_cropping_flag )
+	{
+	    frame_crop_left_offset   = GetBitStreamGolomb( fp );
+	    frame_crop_right_offset  = GetBitStreamGolomb( fp );
+	    frame_crop_top_offset    = GetBitStreamGolomb( fp );
+	    frame_crop_bottom_offset = GetBitStreamGolomb( fp );
+	    if( bShowDetail )
+	    {
+		fprintf( stdout, "crop_left  =%d\n", frame_crop_left_offset );
+		fprintf( stdout, "crop_right =%d\n", frame_crop_right_offset );
+		fprintf( stdout, "crop_top   =%d\n", frame_crop_top_offset );
+		fprintf( stdout, "crop_bottom=%d\n", frame_crop_bottom_offset );
+	    }
+	}
+	vui_parameters_present_flag = GetBitStream( fp, 1 );
+	if( bShowDetail )
+	fprintf( stdout, "vui_parameters=%d\n", vui_parameters_present_flag );
+	if( vui_parameters_present_flag )
+	{
+	    vui_parameters( fp, buffer );
+	}
+//	bDebugGol = 0;
+
+	n_sequenceParameters++;
+#if 1
+	if( skipContent( fp, buffer, 0 )==1 )
+	{
+	    ret = 1;
+	} else {
+	    EXIT();
+	}
+#endif
+	if( bEditSPS )
+	{
+	    int SpecialTermAddr=BitAddr;
+	    int SpecialTermBits=BitOffset;
+	    fprintf( stdout, "Special (%X,%d) (%X,%d) (%X,%d)\n",
+	    	SpecialStartAddr, SpecialStartBits,
+	    	SpecialEndAddr, SpecialEndBits,
+	    	SpecialTermAddr, SpecialTermBits );
+	    g_update_addrS[g_update_countS] = BitAddr;
+	    g_update_bit_S[g_update_countS] = SpecialStartBits;
+	    g_update_bit_E[g_update_countS] = SpecialEndBits;
+	    g_update_bit_T[g_update_countS] = SpecialTermBits;
+	    g_update_mode [g_update_countS] = bEditSPS;
+	    g_update_countS++;
+	}
+	return ret;
+}
+
+int ScalabilitySEI( FILE *fp, unsigned char *buffer )
+{
+int n, j;
+int temporal_id_nesting_flag = (-1);
+int priority_layer_info_present_flag = (-1);
+int priority_id_setting_flag = (-1);
+int num_layers_minus1 = (-1);
+int layer_id = (-1);
+int priority_id = (-1);
+int discardable_flag = (-1);
+int dependency_id = (-1);
+int quality_id = (-1);
+int temporal_id = (-1);
+int sub_pic_layer_flag = (-1);
+int sub_region_layer_flag = (-1);
+int iroi_division_info_present_flag = (-1);
+int profile_level_info_present_flag = (-1);
+int bitrate_info_present_flag = (-1);
+int frm_rate_info_present_flag = (-1);
+int frm_size_info_present_flag = (-1);
+int layer_dependency_info_present_flag = (-1);
+int parameter_sets_info_present_flag = (-1);
+int bitstream_restriction_info_present_flag = (-1);
+int exact_inter_layer_pred_flag = (-1);
+int exact_sample_value_match_flag = (-1);
+int layer_conversion_flag = (-1);
+int layer_output_flag = (-1);
+int layer_profile_level_idc = (-1);
+int avg_bitrate = (-1);
+int max_bitrate_layer = (-1);
+int max_bitrate_layer_representation = (-1);
+int max_bitrate_calc_window = (-1);
+int constant_frm_rate_idc = (-1);
+int avg_frm_rate = (-1);
+int frm_width_in_mbs_minus1  = (-1);
+int frm_height_in_mbs_minus1 = (-1);
+int base_region_layer_id = (-1);
+int dynamic_rect_flag = (-1);
+int horizontal_offset = (-1);
+int vertical_offset   = (-1);
+int region_width      = (-1);
+int region_height     = (-1);
+int roi_id = (-1);
+int iroi_grid_flag = (-1);
+int grid_width_in_mbs_minus1 = (-1);
+int grid_height_in_mbs_minus1 = (-1);
+int num_rois_minus1 = (-1);
+int first_mb_in_roi = (-1);
+int roi_width_in_mbs_minus1 = (-1);
+int roi_height_in_mbs_minus1 = (-1);
+
+	// ------------------------------------------------------
+	fprintf( stdout, "ScalabilitySEI()\n" );
+	InitBitStream( );
+//	bDebugGolB = bDebugGol = 1;
+	bDebugGolB = bDebugGol;
+	temporal_id_nesting_flag         = GetBitStream( fp, 1 );
+	priority_layer_info_present_flag = GetBitStream( fp, 1 );
+	priority_id_setting_flag         = GetBitStream( fp, 1 );
+	num_layers_minus1                = GetBitStreamGolomb( fp );
+	for( n=0; n<=num_layers_minus1; n++ )
+	{
+	    layer_id                                = GetBitStreamGolomb( fp );
+	    priority_id                             = GetBitStream( fp, 6 );
+	    discardable_flag                        = GetBitStream( fp, 1 );
+	    dependency_id                           = GetBitStream( fp, 3 );
+	    quality_id                              = GetBitStream( fp, 4 );
+	    temporal_id                             = GetBitStream( fp, 3 );
+	    sub_pic_layer_flag                      = GetBitStream( fp, 1 );
+	    sub_region_layer_flag                   = GetBitStream( fp, 1 );
+	    iroi_division_info_present_flag         = GetBitStream( fp, 1 );
+	    profile_level_info_present_flag         = GetBitStream( fp, 1 );
+	    bitrate_info_present_flag               = GetBitStream( fp, 1 );
+	    frm_rate_info_present_flag              = GetBitStream( fp, 1 );
+	    frm_size_info_present_flag              = GetBitStream( fp, 1 );
+	    layer_dependency_info_present_flag      = GetBitStream( fp, 1 );
+	    parameter_sets_info_present_flag        = GetBitStream( fp, 1 );
+	    bitstream_restriction_info_present_flag = GetBitStream( fp, 1 );
+	    exact_inter_layer_pred_flag             = GetBitStream( fp, 1 );
+	    if( sub_pic_layer_flag || iroi_division_info_present_flag )
+		exact_sample_value_match_flag       = GetBitStream( fp, 1 );
+	    layer_conversion_flag                   = GetBitStream( fp, 1 );
+	    layer_output_flag                       = GetBitStream( fp, 1 );
+	    if( profile_level_info_present_flag )
+	    {
+		layer_profile_level_idc = GetBitStream( fp, 24 );
+		fprintf( stdout, "layer_profile_level=%X\n",
+			layer_profile_level_idc );
+	    }
+	    if( bitrate_info_present_flag==1 )
+	    {
+		avg_bitrate                      = GetBitStream( fp, 16 );
+		max_bitrate_layer                = GetBitStream( fp, 16 );
+		max_bitrate_layer_representation = GetBitStream( fp, 16 );
+		max_bitrate_calc_window          = GetBitStream( fp, 16 );
+	    }
+	    if( frm_rate_info_present_flag==1 )
+	    {
+		constant_frm_rate_idc = GetBitStream( fp, 2 );
+		avg_frm_rate          = GetBitStream( fp, 16 );
+	    }
+	    if( frm_size_info_present_flag==1 )
+	    {
+		frm_width_in_mbs_minus1  = GetBitStreamGolomb( fp );
+		frm_height_in_mbs_minus1 = GetBitStreamGolomb( fp );
+	    }
+	    if( sub_region_layer_flag==1 )
+	    {
+		base_region_layer_id = GetBitStreamGolomb( fp );
+		dynamic_rect_flag = GetBitStream( fp, 1 );
+		if( dynamic_rect_flag==0 )
+		{
+		    horizontal_offset = GetBitStream( fp, 16 );
+		    vertical_offset   = GetBitStream( fp, 16 );
+		    region_width      = GetBitStream( fp, 16 );
+		    region_height     = GetBitStream( fp, 16 );
+		}
+	    }
+	    if( sub_pic_layer_flag==1 )
+		roi_id = GetBitStreamGolomb( fp );
+	    if( iroi_division_info_present_flag==1 )
+	    {
+		iroi_grid_flag = GetBitStream( fp, 1 );
+		if( iroi_grid_flag )
+		{
+		    grid_width_in_mbs_minus1 = GetBitStreamGolomb( fp );
+		    grid_height_in_mbs_minus1 = GetBitStreamGolomb( fp );
+		} else {
+		    num_rois_minus1 = GetBitStreamGolomb( fp );
+		    for( j=0; j<num_rois_minus1; j++ )
+		    {
+			first_mb_in_roi = GetBitStreamGolomb( fp );
+			roi_width_in_mbs_minus1 = GetBitStreamGolomb( fp );
+			roi_height_in_mbs_minus1 = GetBitStreamGolomb( fp );
+		    }
+		}
+	    }
+	}
+
+	return 0;
+}
+// =============================================================
+// SEI
+//
+int initial_cpb_removal_delay[8];
+int initial_cpb_removal_delay_offset[8];
+
+void SEI( char msg[], int payloadSize )
+{
+	if( bShowDetail )
+	fprintf( stdout, "==============\n" );
+	fprintf( stdout, "SEI : %s(0x%X,0x%X) size=0x%X\n", 
+		msg, g_addr, SrcAddr(g_addr), payloadSize );
+}
+
+int buffering_period( FILE *fp, unsigned char buffer[], int payloadSize )
+{
+int set_id=(-1);
+int i;
+	SEI( "buffering_period SEI", payloadSize );
+#if 1
+	set_id = GetBitStreamGolomb( fp );
+	if( bShowDetail )
+	fprintf( stdout, "id=%d\n", set_id );
+	int NalHrdBpPresentFlag = avc_nal_hrd_parameters_present_flag;
+	int VclHrdBpPresentFlag = avc_vcl_hrd_parameters_present_flag;
+	if( bShowDetail )
+	fprintf( stdout, "NalHrdBpPrsentFlag=%d\n", NalHrdBpPresentFlag );
+	if( bShowDetail )
+	fprintf( stdout, "VclHrdBpPrsentFlag=%d\n", VclHrdBpPresentFlag );
+	if( bShowDetail )
+	fprintf( stdout, "cpb_cnt=%d\n", avc_cpb_cnt );
+	if( NalHrdBpPresentFlag==1 )
+	{
+	    for( i=0; i<=avc_cpb_cnt; i++ )
+	    {
+//	    	initial_cpb_removal_delay[i] = GetBitStreamGolomb( fp );
+//	    	initial_cpb_removal_delay_offset[i] = GetBitStreamGolomb( fp );
+	    	initial_cpb_removal_delay[i] = 
+		    GetBitStream( fp, avc_initial_cpb_removal_delay_length );
+	    	initial_cpb_removal_delay_offset[i] =
+		    GetBitStream( fp, avc_initial_cpb_removal_delay_length );
+		if( bShowDetail )
+		fprintf( stdout, "initial_cpb_removal_delay[%d]=%d\n",
+			i, initial_cpb_removal_delay[i] );
+		if( bShowDetail )
+		fprintf( stdout, "initial_cpb_removal_delay_offset[%d]=%d\n",
+			i, initial_cpb_removal_delay_offset[i] );
+	    }
+	}
+	if( VclHrdBpPresentFlag==1 )
+	{
+	    for( i=0; i<=avc_cpb_cnt; i++ )
+	    {
+/*
+	    	initial_cpb_removal_delay[i] = GetBitStreamGolomb( fp );
+	    	initial_cpb_removal_delay_offset[i] = GetBitStreamGolomb( fp );
+*/
+	    	initial_cpb_removal_delay[i] = 
+		    GetBitStream( fp, avc_initial_cpb_removal_delay_length );
+	    	initial_cpb_removal_delay_offset[i] =
+		    GetBitStream( fp, avc_initial_cpb_removal_delay_length );
+		if( bShowDetail )
+		fprintf( stdout, "initial_cpb_removal_delay[%d]=%d\n",
+			i, initial_cpb_removal_delay[i] );
+		if( bShowDetail )
+		fprintf( stdout, "initial_cpb_removal_delay_offset[%d]=%d\n",
+			i, initial_cpb_removal_delay_offset[i] );
+	    }
+	}
+	return 0;
+#else
+	if( skipContent( fp, buffer, 0 )==1 )
+	{
+	} else {
+	    EXIT();
+	}
+	return 1;
+#endif
+}
+
+int pic_timing( FILE *fp, unsigned char buffer[], int payloadSize )
+{
+int NumClockTS=1;
+int i;
+int cpb_removal_delay = (-1);
+int dpb_output_delay  = (-1);
+int pic_struct = (-1);
+int clock_timestamp_flag = (-1);
+int ct_type = (-1);
+int nuit_field_base_flag = (-1);
+int counting_type = (-1);
+int full_timestamp_flag = (-1);
+int discontinuity_flag = (-1);
+int cnt_dropped_flag = (-1);
+int n_frames = (-1);
+int seconds_value = (-1);
+int minutes_value = (-1);
+int hours_value   = (-1);
+int seconds_flag  = (-1);
+int minutes_flag  = (-1);
+int hours_flag  = (-1);
+int time_offset = (-1);
+
+//	bDebugGolB = bDebugGol = 1;
+	bDebugGolB = bDebugGol;
+	SEI( "pic_timing SEI", payloadSize );
+#if 1
+	if( bShowDetail )
+	fprintf( stdout, "CpbDpbDelaysPresentFlag=%d\n",
+	    avc_CpbDpbDelaysPresentFlag );
+
+	if( avc_CpbDpbDelaysPresentFlag==1 )
+	{
+/*
+	    cpb_removal_delay = GetBitStreamGolomb( fp );
+	    dpb_output_delay  = GetBitStreamGolomb( fp );
+*/
+	    cpb_removal_delay = GetBitStream( fp, 
+	    	avc_cpb_removal_delay_length );
+	    dpb_output_delay  = GetBitStream( fp, 
+	    	avc_dpb_output_delay_length );
+	    if( bShowDetail )
+	    fprintf( stdout, "cpb_removal_delay=%d(0x%X)\n", 
+	    	cpb_removal_delay, cpb_removal_delay );
+	    if( bShowDetail )
+	    fprintf( stdout, "dpb_output_delay =%d\n", dpb_output_delay  );
+	}
+
+	if( bShowDetail )
+	fprintf( stdout, "pic_struct_present_flag=%d\n",
+	    avc_pic_struct_present_flag );
+	if( avc_pic_struct_present_flag==1 )
+	{
+#if 1
+//	    int dummy = GetBitStream( fp, 2 );
+	    pic_struct = GetBitStream( fp, 4 );
+#else
+	    pic_struct = GetBitStreamGolomb( fp );
+#endif
+	    switch( pic_struct )
+	    {
+	    case 0 :
+	    case 1 :
+	    case 2 :
+	    	NumClockTS = 1;
+		break;
+	    case 3 :
+	    case 4 :
+	    case 7 :
+	    	NumClockTS = 2;
+		break;
+	    case 5 :
+	    case 6 :
+	    case 8 :
+	    	NumClockTS = 3;
+		break;
+	    default :
+	    	fprintf( stdout, "Unknown pic_struct(%d)\n", pic_struct );
+		break;
+	    }
+	    if( bShowDetail )
+	    fprintf( stdout, "pic_struct=%d\n", pic_struct );
+	    if( bShowDetail )
+	    fprintf( stdout, "NumClockTS=%d\n", NumClockTS );
+	    for( i=0; i<NumClockTS; i++ )
+	    {
+		if( bShowDetail )
+		fprintf( stdout, "NumClockTS(%d/%d)\n", i, NumClockTS );
+		clock_timestamp_flag = GetBitStream( fp, 1 );
+		if( bShowDetail )
+		    fprintf( stdout, "clock_timestamp_flag=%d\n",
+			clock_timestamp_flag );
+		if( clock_timestamp_flag==1 )
+		{
+		    ct_type              = GetBitStream( fp, 2 );
+		    if( bShowDetail )
+		    fprintf( stdout, "ct_type=%d\n", ct_type );
+		    nuit_field_base_flag = GetBitStream( fp, 1 );
+		    counting_type        = GetBitStream( fp, 5 );
+		    full_timestamp_flag  = GetBitStream( fp, 1 );
+		    discontinuity_flag   = GetBitStream( fp, 1 );
+		    cnt_dropped_flag     = GetBitStream( fp, 1 );
+		    n_frames             = GetBitStream( fp, 8 );
+		    if( bShowDetail )
+		    fprintf( stdout, "n_frames=%d\n", n_frames );
+		    if( bShowDetail )
+		    fprintf( stdout, "full_timestamp_flag=%d\n", 
+		    	full_timestamp_flag );
+		    if( full_timestamp_flag==1 )
+		    {
+			seconds_value = GetBitStream( fp, 6 );
+			minutes_value = GetBitStream( fp, 6 );
+			hours_value   = GetBitStream( fp, 5 );
+		    } else {
+			seconds_flag  = GetBitStream( fp, 1 );
+			fprintf( stdout, "seconds_flag=%d\n", 
+				seconds_flag );
+			if( seconds_flag )
+			{
+			    seconds_value = GetBitStream( fp, 6 );
+			    minutes_flag  = GetBitStream( fp, 1 );
+			    fprintf( stdout, "minutes_flag=%d\n", 
+				minutes_flag );
+			    if( minutes_flag )
+			    {
+				minutes_value = GetBitStream( fp, 6 );
+				hours_flag  = GetBitStream( fp, 1 );
+				fprintf( stdout, "hours_flag=%d\n", 
+				    hours_flag );
+				if( hours_flag )
+				{
+				    hours_value = GetBitStream( fp, 5 );
+				}
+			    }
+			}
+		    }
+		    if( seconds_value>=0 )
+		    fprintf( stdout, "seconds_value=%d\n", seconds_value );
+		    if( minutes_value>=0 )
+		    fprintf( stdout, "minutes_value=%d\n", minutes_value );
+		    if( hours_value>=0 )
+		    fprintf( stdout, "hours_value  =%d\n", hours_value );
+		    if( avc_time_offset_length>0 )
+		    {
+			fprintf( stdout, "time_offset_length=%d\n", 
+				avc_time_offset_length );
+//			time_offset = GetBitStreamGolomb( fp );
+// 2011/9/29
+			time_offset = GetBitStream( fp, 
+				avc_time_offset_length );
+			if( bShowDetail )
+			fprintf( stdout, "time_offset =%d(0x%X)\n", 
+				time_offset, time_offset );
+		    }
+		}
+	    }
+	}
+	return 0;
+#else
+	if( skipContent( fp, buffer, bDebugSkip )==1 )
+	{
+	} else {
+	    EXIT();
+	}
+	return 1;
+#endif
+}
+
+// 2011.7.28
+int filler_payload( FILE *fp, unsigned char buffer[], int payloadSize )
+{
+int i;
+int ff_byte;
+int error=0;
+
+	bDebugGolB = bDebugGol;
+	SEI( "filler_payload", payloadSize );
+#if 1
+	for( i=0; i<payloadSize; i++ )
+	{
+	    ff_byte = GetBitStream( fp, 8 );
+	    if( ff_byte!=0xFF )
+	    {
+	    	fprintf( stdout, "ff_byte=0x%02X\n", ff_byte );
+		error++;
+	    }
+	}
+	if( error==0 )
+	    return 0;
+	else
+	    return 1;
+#else
+	if( skipContent( fp, buffer, bDebugSkip )==1 )
+	{
+	} else {
+	    EXIT();
+	}
+	return 1;
+#endif
+}
+
+int user_data_registered( FILE *fp, unsigned char buffer[], int payloadSize )
+{
+
+	bDebugGolB = bDebugGol;
+	SEI( "user_data_registered", payloadSize );
+#if 1
+    unsigned char user_data;
+	fprintf( stdout, "[UserData] pts  = 0x%04X%06X\n", userdata_ptsh, userdata_ptsl );
+	fprintf( stdout, "[UserData] size = 0x%08X\n", payloadSize );
+	fprintf( stdout, "[UserData] data =" );
+	for (int i=0; i<payloadSize; i++) {
+	    user_data = GetBitStream( fp, 8 );
+    	fprintf( stdout, " %02X", user_data );
+	}
+	fprintf( stdout, "\n" );
+	b_user_data = true;
+    return 1;
+#else
+	if( skipContent( fp, buffer, bDebugSkip )==1 )
+	{
+	} else {
+	    EXIT();
+	}
+	return 1;
+#endif
+}
+
+int user_data_unregistered( FILE *fp, unsigned char buffer[], int payloadSize )
+{
+
+	bDebugGolB = bDebugGol;
+	SEI( "user_data_unregistered", payloadSize );
+#if 1
+    unsigned char user_data;
+	fprintf( stdout, "[UserData] pts  = 0x%04X%06X\n", userdata_ptsh, userdata_ptsl );
+	fprintf( stdout, "[UserData] size = 0x%08X\n", payloadSize );
+	fprintf( stdout, "[UserData] data =" );
+	for (int i=0; i<payloadSize; i++) {
+	    user_data = GetBitStream( fp, 8 );
+    	fprintf( stdout, " %02X", user_data );
+	}
+	fprintf( stdout, "\n" );
+	b_user_data = true;
+    return 1;
+#else
+	if( skipContent( fp, buffer, bDebugSkip )==1 )
+	{
+	} else {
+	    EXIT();
+	}
+	return 1;
+#endif
+}
+
+int recovery_point( FILE *fp, unsigned char buffer[], int payloadSize )
+{
+int recovery_frame_cnt       = (-1);
+int exact_match_flag         = (-1);
+int broken_link_flag         = (-1);
+int changing_slice_group_idc = (-1);
+
+//	bDebugGolB = bDebugGol = 1;
+	bDebugGolB = bDebugGol;
+	SEI( "recovery_point SEI", payloadSize );
+#if 1
+	recovery_frame_cnt       = GetBitStreamGolomb( fp );
+	exact_match_flag         = GetBitStream( fp, 1 );
+	broken_link_flag         = GetBitStream( fp, 1 );
+	changing_slice_group_idc = GetBitStream( fp, 2 );
+	fprintf( stdout, "recovery_frame_cnt=%d\n", recovery_frame_cnt );
+	fprintf( stdout, "exact_match_flag=%d\n", exact_match_flag );
+	fprintf( stdout, "broken_link_flag=%d\n", broken_link_flag );
+	fprintf( stdout, "changing_slice_group=%d\n", 
+		changing_slice_group_idc );
+	return 0;
+#else
+	if( skipContent( fp, buffer, bDebugSkip )==1 )
+	{
+	} else {
+	    EXIT();
+	}
+	return 1;
+#endif
+}
+int frame_packing_arrangement( FILE *fp, unsigned char buffer[], 
+	int payloadSize )
+{
+int frame_packing_arrangement_id       = (-1);
+int frame_packing_arrangement_cancel_flag = (-1);
+int frame_packing_arrangement_type = (-1);
+int quincunx_sampling_flag         = (-1);
+int content_interpretation_type    = (-1);
+int spatial_flipping_flag          = (-1);
+int frame0_flipped_flag            = (-1);
+int field_views_flag               = (-1);
+int current_frame_is_frame0_flag   = (-1);
+int frame0_self_contained_flag     = (-1);
+int frame1_self_contained_flag     = (-1);
+int frame0_grid_position_x = (-1);
+int frame0_grid_position_y = (-1);
+int frame1_grid_position_x = (-1);
+int frame1_grid_position_y = (-1);
+int frame_packing_arrangement_reserved_byte = (-1);
+int frame_packing_arrangement_repetition_period = (-1);
+int frame_packing_arrangement_extension_flag = (-1);
+
+//	bDebugGolB = bDebugGol = 1;
+	bDebugGolB = bDebugGol;
+	SEI( "frame_packing_arrangement SEI", payloadSize );
+	
+    int pos = ftell(fp);
+	fprintf( stdout, "pos=0x%x\n", pos );
+    unsigned char user_data;
+	fprintf( stdout, "[UserData] pts  = 0x%04X%06X\n", userdata_ptsh, userdata_ptsl );
+	fprintf( stdout, "[UserData] size = 0x%08X\n", payloadSize );
+	fprintf( stdout, "[UserData] data =" );
+	for (int i=0; i<payloadSize; i++) {
+	    user_data = GetBitStream( fp, 8 );
+    	fprintf( stdout, " %02X", user_data );
+	}
+	fprintf( stdout, "\n" );
+	b_user_data = true;
+    fseek(fp, pos, SEEK_SET);
+    g_addr -= payloadSize;
+    InitBitStream();
+#if 1
+	frame_packing_arrangement_id       = GetBitStreamGolomb( fp );
+	fprintf( stdout, "frame_packing_arrangement_id=%d\n",
+		frame_packing_arrangement_id );
+	frame_packing_arrangement_cancel_flag = GetBitStream( fp, 1 );
+	fprintf( stdout, "frame_packing_arrangement_cancel_flag=%d\n",
+		frame_packing_arrangement_cancel_flag );
+	if( frame_packing_arrangement_cancel_flag==0 )
+	{
+	    frame_packing_arrangement_type = GetBitStream( fp, 7 );
+	    fprintf( stdout, "frame_packing_arrangement_type=%d\n",
+		frame_packing_arrangement_type );
+	    quincunx_sampling_flag         = GetBitStream( fp, 1 );
+	    content_interpretation_type    = GetBitStream( fp, 6 );
+	    spatial_flipping_flag          = GetBitStream( fp, 1 );
+	    frame0_flipped_flag            = GetBitStream( fp, 1 );
+	    field_views_flag               = GetBitStream( fp, 1 );
+	    current_frame_is_frame0_flag   = GetBitStream( fp, 1 );
+	    frame0_self_contained_flag     = GetBitStream( fp, 1 );
+	    frame1_self_contained_flag     = GetBitStream( fp, 1 );
+	    if( (quincunx_sampling_flag==0)
+	    && (frame_packing_arrangement_type!=5) )
+	    {
+		frame0_grid_position_x = GetBitStream( fp, 4 );
+		frame0_grid_position_y = GetBitStream( fp, 4 );
+		frame1_grid_position_x = GetBitStream( fp, 4 );
+		frame1_grid_position_y = GetBitStream( fp, 4 );
+	    }
+	    frame_packing_arrangement_reserved_byte = GetBitStream( fp, 8 );
+	    frame_packing_arrangement_repetition_period = 
+	    	GetBitStreamGolomb( fp );
+	}
+	frame_packing_arrangement_extension_flag = GetBitStream( fp, 1 );
+	fprintf( stdout, "frame_packing_arrangement_extension_flag=%d\n",
+	    frame_packing_arrangement_extension_flag );
+	return 0;
+#else
+	if( skipContent( fp, buffer, bDebugSkip )==1 )
+	{
+	} else {
+	    EXIT();
+	}
+	return 1;
+#endif
+}
+int sub_seq_characteristics( FILE *fp, unsigned char buffer[], int payloadSize )
+{
+	SEI( "sub_seq_characteristics SEI", payloadSize );
+	fprintf( stdout, "No parse\n" );
+	if( skipContent( fp, buffer, 0 )==1 )
+	{
+	} else {
+	    EXIT();
+	}
+	return 1;
+}
+
+int scene_info( FILE *fp, int payloadSize )
+{
+int scene_info_present_flag = (-1);
+int scene_id = (-1);
+int scene_transition_type = (-1);
+int second_scene_id = (-1);
+	// -------------------------------------------------
+	SEI( "scene_info", payloadSize );
+	scene_info_present_flag = GetBitStream( fp, 1 );
+	fprintf( stdout, "scene_info_present_flag = %d\n", 
+		scene_info_present_flag );
+	if( scene_info_present_flag==1 )
+	{
+	    scene_id = GetBitStreamGolomb( fp );
+	    fprintf( stdout, "scene_id = %d\n", scene_id );
+	    scene_transition_type = GetBitStreamGolomb( fp );
+	    fprintf( stdout, "scene_transition_typ = %d\n", 
+	    	scene_transition_type );
+	    if( scene_transition_type>3 )
+		second_scene_id = GetBitStreamGolomb( fp );
+	}
+	return 0;
+}
+
+int pan_scan_rect( FILE *fp, unsigned char *buffer )
+{
+int nSize=0;
+int id=(-1);
+int cancel_flag=(-1);
+int cnt_minus1=(-1);
+int left_offset=(-1);
+int right_offset=(-1);
+int top_offset=(-1);
+int bottom_offset=(-1);
+int period=(-1);
+int i;
+	// -------------------------------------------------
+	fprintf( stdout, "==============\n" );
+	fprintf( stdout, "pan_scan_rect() : 0x%X(0x%X)\n", 
+		BitAddr+BitOffset/8, SrcAddr(BitAddr+BitOffset/8) );
+	int tmp = bDebugGolB;
+	bDebugGolB = 1;
+
+	id          = GetBitStreamGolomb( fp );
+	cancel_flag = GetBitStream( fp, 1 );
+	fprintf( stdout, "id=%d\n", id );
+	fprintf( stdout, "pan_scan_rect_cancel_flag=%d\n", cancel_flag );
+	if( cancel_flag==0 )
+	{
+	    cnt_minus1  = GetBitStreamGolomb( fp );
+	    for( i=0; i<=cnt_minus1; i++ )
+	    {
+		int BitSt;
+		BitSt = BitOffset;
+		left_offset   = GetBitStreamGolomb( fp );
+//		int next = GolombNext( left_offset, value[ID_PANL] );
+//		fprintf( stdout, "Update Golomb(%d->%d)\n", left_offset, next );
+		UpdateProcedureGolomb( n_pan_scan, 
+		    ID_PANL, BitOffset-BitSt,
+		    GolombValue(GolombNext(left_offset, value[ID_PANL])) );
+
+		BitSt = BitOffset;
+		right_offset  = GetBitStreamGolomb( fp );
+		UpdateProcedureGolomb( n_pan_scan, 
+		    ID_PANR, BitOffset-BitSt,
+		    GolombValue(GolombNext(right_offset, value[ID_PANR])) );
+
+		BitSt = BitOffset;
+		top_offset    = GetBitStreamGolomb( fp );
+		UpdateProcedureGolomb( n_pan_scan, 
+		    ID_PANT, BitOffset-BitSt,
+		    GolombValue(GolombNext(top_offset, value[ID_PANT])) );
+
+		BitSt = BitOffset;
+		bottom_offset = GetBitStreamGolomb( fp );
+		UpdateProcedureGolomb( n_pan_scan, 
+		    ID_PANB, BitOffset-BitSt,
+		    GolombValue(GolombNext(bottom_offset, value[ID_PANB])) );
+
+		fprintf( stdout, 
+		"pan_scan_cnt(%d) : left=%d, right=%d, top=%d, bottom=%d\n",
+			i,
+			left_offset,
+			right_offset,
+			top_offset,
+			bottom_offset );
+	    }
+	    period = GetBitStreamGolomb( fp );
+	    fprintf( stdout, "pan_scan_repetition_period=%d\n", period );
+	}
+
+	bDebugGolB = tmp;
+	n_pan_scan ++;
+
+	return 0;
+}
+
+int quality_layer_integrity_check( FILE *fp, unsigned char *buffer )
+{
+int nSize=0;
+int i;
+int cnt_minus1 = (-1);
+
+	// -------------------------------------------------
+	fprintf( stdout, "==============\n" );
+	fprintf( stdout, "quality_layer_integrity_check() : 0x%X(0x%X)\n", 
+		BitAddr+BitOffset/8, SrcAddr(BitAddr+BitOffset/8) );
+	int tmp = bDebugGolB;
+	bDebugGolB = 1;
+
+	{
+	    int entry_dependency_id;
+	    int quality_layer_crc  ;
+	    cnt_minus1  = GetBitStreamGolomb( fp );
+	    fprintf( stdout, "num_minus1=%d\n", cnt_minus1 );
+	    for( i=0; i<=cnt_minus1; i++ )
+	    {
+		entry_dependency_id   = GetBitStream( fp,  3 );
+		quality_layer_crc     = GetBitStream( fp, 16 );
+		fprintf( stdout, "%d : %d, %d\n",
+			i, 
+			entry_dependency_id,
+			quality_layer_crc );
+	    }
+	}
+
+	bDebugGolB = tmp;
+
+	return 0;
+}
+
+int deblocking_filter_display_preference( FILE *fp, unsigned char *buffer )
+{
+	fprintf( stdout, "==============\n" );
+	fprintf( stdout, "deblocking_filter_display_preference SEI\n" );
+	fprintf( stdout, "No parse\n" );
+	if( skipContent( fp, buffer, 0 )==1 )
+	{
+	} else {
+	    EXIT();
+	}
+	return 1;
+}
+
+// -------------------------------------------------------------
+int SupplementalEnhancementInformation( FILE *fp, unsigned char *buffer )
+{
+int payloadType = (-1);
+int payloadSize = (-1);
+int nFF=0;
+	// -------------------------------------------------
+	if( bShowDetail )
+	fprintf( stdout, "SupplementalEnhancementInformation()\n" );
+	InitBitStream( );
+
+	if( bDebugSEI )
+	fprintf( stdout, "Addr(%X,%X)\n", g_addr, SrcAddr(g_addr) );
+
+	while( 1 )
+	{
+	    do {
+		payloadType     = GetBitStream( fp, 8 );
+		if( payloadType==0xFF )
+		    nFF++;
+	    } while( payloadType==0xFF );
+	    payloadType += nFF*0xFF;
+
+	    nFF=0;
+	    do {
+		payloadSize     = GetBitStream( fp, 8 );
+		if( payloadSize==0xFF )
+		    nFF++;
+	    } while( payloadSize==0xFF );
+	    payloadSize += nFF*0xFF;
+	    if( bDebugSEI )
+	    {
+	    fprintf( stdout, "payloadType=0x%X\n", payloadType );
+	    fprintf( stdout, "payloadSize=0x%X\n", payloadSize );
+	    }
+	    if( payloadSize==0 )
+	    {
+		if( bDebugSEI )
+	    	fprintf( stdout, "done\n" );
+	    	break;
+	    }
+	    Packets[0x0600 | payloadType]++;
+
+	    InitBitStream( );
+	    // SEI payload
+	    switch( payloadType )
+	    {
+	    case 0 :
+		if( buffering_period( fp, buffer, payloadSize )==1 )
+		    return 4;
+		break;
+	    case 1 :
+		if( pic_timing( fp, buffer, payloadSize )==1 )
+		    return 4;
+		break;
+	    case 3 :	// 2011.7.28
+		if( filler_payload( fp, buffer, payloadSize )!=0 )
+		    return 4;
+		break;
+	    case 4 :
+		if( user_data_registered( fp, buffer, payloadSize )!=0 )
+		    return 4;
+	    	break;
+	    case 5 :
+		if( user_data_unregistered( fp, buffer, payloadSize )!=0 )
+		    return 4;
+	    	break;
+
+	    case 6 :
+		if( recovery_point( fp, buffer, payloadSize )!=0 )
+		    return 4;
+		break;
+	    case 45 :
+		if( frame_packing_arrangement( fp, buffer, payloadSize )==1 )
+		    return 4;
+		break;
+
+	    case 12 :
+		sub_seq_characteristics( fp, buffer, payloadSize );
+		return 4;
+	    case 9 :
+		scene_info( fp, payloadSize );
+		break;
+	    case 2 :
+		pan_scan_rect( fp, buffer );
+		break;
+	// akagawa
+	    case 32 :
+		quality_layer_integrity_check( fp, buffer );
+		break;
+	// AKB
+	    case 20 :
+	    	if( deblocking_filter_display_preference( fp, buffer )==1 )
+			return 4;
+		break;
+
+	    default :
+		fprintf( stdout, 
+			"payloadType(%d) : not implemented %8X(%8X)\n",
+			payloadType, g_addr, SrcAddr(g_addr) );
+		EXIT();
+	    }
+	    ShowBitAddr( );
+
+	    int rest = payloadSize*8;
+	    fprintf( stdout, "rest=%d, payloadSize=%d\n", rest, payloadSize);
+	    fprintf( stdout, "BitOffset=%d, BitSkip=%d\n", 
+	    	BitOffset, BitSkip);
+	    if( (BitOffset-BitSkip*8)>rest )
+	    {
+	    	fprintf( stdout, "payloadSize=%d\n", payloadSize );
+	    	fprintf( stdout, 
+			"restBit=%d < (BitOffset=%d,BitSkip=%d*8)\n", 
+			rest, BitOffset, BitSkip );
+		EXIT();
+	    }
+//	    rest -= (BitOffset-BitSkip*8);
+	    rest -= (BitOffset);	// 2011.9.29
+	    while( rest>0 )
+	    {
+	    	int dummy;
+	    	int size = (rest>16) ? 16 : rest;
+//		fprintf( stdout, "rest=%d, size=%d\n", rest, size );
+		dummy = GetBitStream( fp, size );
+		rest -= size;
+	    }
+	}
+	buffer[0]=0;
+	buffer[1]=0;
+	if( payloadType==0 )
+	    return 2;	// readed size
+	else
+	    return 1;	// readed size
+}
+
+int AccessUnitDelimiter( FILE *fp, unsigned char *buffer )
+{
+int picType=(-1);
+	// -------------------------------------------------
+	InitBitStream( );
+	picType = GetBitStream( fp, 3 );
+	if( bShowDetail )
+	fprintf( stdout, "AccessUnitDelimiter(%d)\n", picType );
+	if( picType==0 )
+	{
+	    fprintf( stdout, "IDR begin(%X,%X)\n", g_addr, SrcAddr(g_addr) );
+	    // Reset parameters
+	    avc_pic_struct_present_flag = (-1);
+	    avc_nal_hrd_parameters_present_flag=(-1);
+	    avc_vcl_hrd_parameters_present_flag=(-1);
+	    avc_cpb_cnt = (-1);
+	    avc_CpgDpbDelaysPresentFlag = (-1);
+	    avc_time_offset_length = (-1);
+	    avc_CpbDpbDelaysPresentFlag = (-1);
+	}
+	return 0;
+}
+
+int FillerData( FILE *fp, unsigned char *buffer )
+{
+int ffByte;
+int nSize=0;
+	InitBitStream( );
+	int tmp = bDebugGolB;
+	bDebugGolB = 0;
+	while( 1 )
+	{
+//	fprintf( stdout, "0x%X,%d : ", g_addr, BitOffset );
+	    ffByte = GetBitStream( fp, 8 );
+	    nSize++;
+	    if( ffByte!=0xFF )
+		break;
+	}
+	bDebugGolB = tmp;
+	if( bShowDetail )
+	fprintf( stdout, "FillerData() : %d bytes\n", nSize );
+	return 0;
+}
+
+int Slice_header( FILE *fp, unsigned char *buffer )
+{
+	int tmp = bDebugGolB;
+	InitBitStream( );
+	bDebugGolB = 0;
+
+	if( bShowDetail )
+	fprintf( stdout, "Slice_header()\n" );
+	int first_mb_in_slice    = GetBitStreamGolomb( fp );
+	int slice_type           = GetBitStreamGolomb( fp );
+	int pic_parameter_set_id = GetBitStreamGolomb( fp );
+	if( avc_separate_colour_plane_flag==1 )
+	{
+	    int colour_plane_id = GetBitStream( fp, 1 );
+	    if( bShowDetail )
+	    fprintf( stdout, "colour_plane_id = %d\n", colour_plane_id );
+	}
+	int frame_num            = GetBitStreamGolomb( fp );
+
+	if( bShowDetail )
+	{
+	fprintf( stdout, "first_mb_in_slice = %d\n", first_mb_in_slice );
+	fprintf( stdout, "slice_type        = %d\n", slice_type        );
+	fprintf( stdout, "pic_parameter_set = %d\n", pic_parameter_set_id );
+	fprintf( stdout, "frame_num         = %d\n", frame_num            );
+	}
+
+    if (first_mb_in_slice == 0) {
+        unsigned long picture_coding_type;
+        switch (slice_type) {
+        case 2:
+        case 4:
+        case 7:
+        case 9:
+            picture_coding_type = 1;
+            break;
+        case 0:
+        case 3:
+        case 5:
+        case 8:
+            picture_coding_type = 2;
+            break;
+        default:
+            picture_coding_type = 3 ;
+            break;
+        }
+        if (b_user_data) {
+            fprintf( stdout, "[UserData] picture_coding_type = 0x%08X\n", picture_coding_type );
+            b_user_data = false;
+        }
+    }
+
+	if( avc_frame_mbs_only_flag==0 )
+	{
+	    int field_pic_flag = GetBitStream( fp, 1 );
+	    if( bShowDetail )
+	    fprintf( stdout, "field_pic_flag = %d\n", field_pic_flag );
+	    if( field_pic_flag )
+	    {
+		int bottom_field_flag = GetBitStream( fp, 1 );
+		if( bShowDetail )
+		fprintf( stdout, "bottom_field_flag = %d\n", 
+			bottom_field_flag );
+	    }
+	}
+
+	bDebugGolB = tmp;
+	return 0;
+}
+
+int Counts[256];
+
+int CountNAL( int addrS, int bitsS, int addrE, int bitsE, int code )
+{
+	addrS -= 4;
+	if( bShowNALinfo )
+	fprintf( stdout, "CountNAL(0x%X,%d-0x%X,%d, Code(%d))\n", 
+		addrS, bitsS, addrE, bitsE, code );
+	int addr_diff = addrE-addrS;
+	int bits_diff = bitsE-bitsS;
+	int size = (7+addr_diff+bits_diff)/8;
+	if( bShowNALinfo )
+	fprintf( stdout, "Code(%02X) : %X:%d(%X:%d) - %X:%d(%X:%d) (0x%X)\n", 
+		code, 
+		addrS, bitsS, (addrS+bitsS/8), bitsS%8,
+		addrE, bitsE, (addrE+bitsE/8), bitsE%8,
+		size );
+	Counts[code] += size;
+	return size;
+}
+
+int AnalyzeAVC( FILE *fp, FILE *pts_fp )
+{
+int eof=0;
+unsigned char buffer[BUF_SIZE];
+int ID, len;
+int addr=0;
+int Error=0;
+int nItem = (-1);
+int readed=0, written;
+int readP=0, size;
+int i, ret=0;
+int addrS=(-1);
+int addrE=(-1);
+int bitsS=(-1);
+int bitsE=(-1);
+int bFirst=1;
+unsigned long PTSH, PTSL, DTSH, DTSL;
+
+	for( i=0; i<256; i++ )
+	{
+	    Counts[i] = 0;
+	}
+	while( eof==0 )
+	{
+	    if( readP<4 )
+	    {
+	    	size = 4-readP;
+//		fprintf( stdout, "gread@%d, %d\n", readP, size );
+		readed = gread( &buffer[readP], 1, size, fp );
+		if( readed<size )
+		{
+		    CannotRead( "Prefix" );
+		    break;
+		}
+		readP+=size;
+	    }
+	    if( (buffer[0]==0x00)
+	     && (buffer[1]==0x00)
+	     && (buffer[2]==0x00) )
+	    {
+//		fprintf( stdout, "00 00 00 : %X\n", g_addr );
+	    	memcpy( &buffer[0], &buffer[1], 3 );
+		readed = gread( &buffer[3], 1, 1, fp );
+		if( readed<1 )
+		{
+		    CannotRead( "Prefix" );
+		    break;
+		}
+		continue;
+	    }
+
+	    if( (buffer[0]!=0x00)
+	     || (buffer[1]!=0x00)
+	     || (buffer[2]!=0x01) )
+	    {
+	    	if( bFirst )
+		{
+		    if( skipContent( fp, buffer, 0 )==1 )
+		    {
+			readP=4;
+		    } else {
+		    	eof=1;
+		    }
+		} else {
+		    fprintf( stdout, "Invalid Prefix %02X %02X %02X : @%X\n",
+			    buffer[0], buffer[1], buffer[2], g_addr-4 );
+		    EXIT();
+		}
+	    } else {
+		bFirst=0;
+		ID = buffer[3];
+		readP=0;
+		{
+//		    if( bDump )
+			fprintf( stdout, "%02X %02X %02X %02X : ",
+			    buffer[0], buffer[1], buffer[2], buffer[3] );
+		    Packets[ID]++;
+		    InitBitStream( );
+		    addrS = BitAddr;
+		    bitsS = BitOffset;
+		    // ID : nal_unit_typ = 0..31
+		    switch( ID )
+		    {
+		    case 0xE0 :
+			// use gread() only
+			fprintf( stdout, "ID=%02X : PES_header(%X,%X)\n", 
+			    ID, g_addr, SrcAddr(g_addr) );
+			PES_header( fp, buffer, 1, PTSH, PTSL, DTSH, DTSL );
+			fprintf( pts_fp, "%8X %8X : %4X %08X, %4X %08X\n",
+				g_addr, SrcAddr(g_addr),
+				PTSH, PTSL, DTSH & 0xFFFF, DTSL );
+			//
+			BitAddr = g_addr;
+			bitsE = 0;
+			addrE = BitAddr;
+			bitsE = BitOffset;
+			CountNAL( addrS, bitsS, addrE, bitsE, 0xE0 );
+			break;
+		// 9 : AU delimiter
+		    case 9 :
+			fprintf( stdout, "ID=%02X : AUD(%X)\n", ID, g_addr );
+			ret = AccessUnitDelimiter( fp, buffer );
+			if( ret<0 )
+			    eof=1;
+			else if( ret>0 )
+			    readP = ret;
+			addrE = BitAddr;
+			bitsE = BitOffset;
+			CountNAL( addrS, bitsS, addrE, bitsE, 0x09 );
+			break;
+		// 6 : SEI
+		    case 6 :
+			fprintf( stdout, "ID=%02X : SEI(%X,%X)\n", 
+				ID, g_addr, SrcAddr(g_addr) );
+			ret = SupplementalEnhancementInformation( fp, buffer );
+			if( ret>0 )
+			    readP = ret;
+			addrE = BitAddr;
+			bitsE = BitOffset;
+			CountNAL( addrS, bitsS, addrE, bitsE, 0x06 );
+			break;
+		// 5 : IDR picutre slice
+		    case 0x25 :	// 2010.12.14
+		    case 0x45 :	// 2011.7.4
+		    case 0x65 :
+			fprintf( stdout, 
+			    "ID=%02X : Slice (IDR picture) (%X,%X)\n", 
+			    ID, g_addr, SrcAddr(g_addr) );
+			Slice_header( fp, buffer );
+
+			if( skipContent( fp, buffer, 0 )==1 )
+			{
+			    readP=4;
+			} else {
+			    eof=1;
+			}
+			addrE = g_addr;
+			bitsE = 0;
+			CountNAL( addrS, bitsS, addrE, bitsE, 0x5 );
+			break;
+		// 7 : SPS
+		    case 0x27 :	// 2010.12.9
+		    case 0x67 :
+			fprintf( stdout, 
+			    "ID=%02X : Sequence parameter set(%X)\n", 
+			    ID, g_addr );
+			ret = SequenceParameterSet( fp, buffer );
+			if( ret==1 )
+			    readP=4;
+			else if( ret<0 )
+			    eof=1;
+			addrE = BitAddr;
+			bitsE = BitOffset;
+			CountNAL( addrS, bitsS, addrE, bitsE, 0x7 );
+			break;
+		// 8 : PPS
+		    case 0x28 :	// 2010.12.9
+		    case 0x68 :
+			fprintf( stdout, 
+			    "ID=%02X : Picture parameter set(%X,%X)\n", 
+			    ID, g_addr, SrcAddr(g_addr) );
+    #if 1
+			if( skipContent( fp, buffer, 0 )==1 )
+			{
+			    readP=4;
+			} else {
+			    eof=1;
+			}
+			addrE = g_addr;
+			bitsE = 0;
+    #else
+			addrE = BitAddr;
+			bitsE = BitOffset;
+    #endif
+			CountNAL( addrS, bitsS, addrE, bitsE, 0x8 );
+			break;
+		    case 0x01 :
+		    case 0x21 :
+		    case 0x41 :
+		    case 0x61 :
+			fprintf( stdout, 
+			    "ID=%02X : Slice (non-IDR picture) (%X)\n", 
+				    ID, g_addr );
+			Slice_header( fp, buffer );
+    #if 1
+			if( skipContent( fp, buffer, 0 )==1 )
+			{
+			    readP=4;
+			} else {
+			    eof=1;
+			}
+			addrE = g_addr;
+			bitsE = 0;
+    #else
+			addrE = BitAddr;
+			bitsE = BitOffset;
+    #endif
+			CountNAL( addrS, bitsS, addrE, bitsE, 0x1 );
+			break;
+		// 12 : Filler data
+		    case 0x0C :
+			fprintf( stdout, "ID=%02X : FillerData(%X)\n", 
+				ID, g_addr );
+			ret = FillerData( fp, buffer );
+			if( ret<0 )
+			    eof=1;
+			else if( ret>0 )
+			    readP = ret;
+			addrE = BitAddr;
+			bitsE = BitOffset;
+			size = CountNAL( addrS, bitsS, addrE, bitsE, 0xC );
+			if( bShowDetail )
+			fprintf( stdout, "Filler size=%d\n", size );
+			break;
+		// 10 : End of Sequence
+		    case 10 :
+			fprintf( stdout, 
+			    "ID=%02X : End of sequence (%02X:%X)\n", 
+			    ID, g_addr );
+    #if 1
+			if( skipContent( fp, buffer, 0 )==1 )
+			{
+			    readP=4;
+			} else {
+			    eof=1;
+			}
+			addrE = g_addr;
+			bitsE = 0;
+    #else
+			addrE = BitAddr;
+			bitsE = BitOffset;
+    #endif
+			size = CountNAL( addrS, bitsS, addrE, bitsE, 0xA );
+			break;
+		    default :
+			fprintf( stdout, 
+			"ID=%02X : Not implemented in AnaylzeAVC (%X,%X)\n", 
+				    ID, g_addr, SrcAddr(g_addr) );
+			if( bSkipError==0 )
+			{
+			    EXIT();
+			} else {
+			    fprintf( stdout, "=========================\n" );
+			    fprintf( stdout, "Skip Error\n" );
+			    if( skipContent( fp, buffer, 0 )==1 )
+			    {
+				readP=4;
+			    } else {
+				eof=1;
+			    }
+			}
+			break;
+		    }
+		}
+	    }
+	}
+	fprintf( stdout, "eof=%d\n", eof );
+	fprintf( stdout, "addr=%X\n", g_update_addr[0] );
+	fprintf( stdout, "bits=%X\n", g_update_bits[0] );
+	fprintf( stdout, "size=%X\n", g_update_size[0] );
+	fprintf( stdout, "data=%X\n", g_update_data[0] );
+
+	for( i=0; i<256; i++ )
+	{
+	    if( Counts[i]>0 )
+		fprintf( stdout, "Code[%02X] = 0x%X\n", i, Counts[i] );
+	}
+	return 0;
+}
+
+
+void TS_addr_Dump( long *TS_addr, int nTS )
+{
+int n;
+    fprintf( stdout, "TS_addr\n" );
+	for( n=0; n<nTS; n++ )
+	{
+	    fprintf( stdout, "TS(%5d) : %8X\n", n, TS_addr[n] );
+	}
+}
+
+int Remux( char *srcFilename, char *outFilename, 
+	char *textFilename, FILE *pts_fp, int Threshold )
+{
+int index;
+FILE *ts_fp = fopen( "ts.bin", "wb" );
+
+#define MAX_PCR 1024*1024*1
+long long *PCR_addr;
+long long *PCR_data;
+int nPCR=0;
+#define MAX_PTS 1024*1024*1
+long long *PTS_addr;
+long long *PTS_data;
+int nPTS=0;
+// 16M*188=3G max
+#define MAX_TS 1024*1024*16
+long *TS_addr = NULL;
+int nTS=0;
+
+#define MAX_DATA 1024*1024*8
+long long *DATA_addr = NULL;
+long long *DATA_pts  = NULL;
+int nDATA=0;
+#define MAX_NULL 1024*1024*8
+long long *NULL_addr = NULL;
+int nNULL=0;
+
+int i, n;
+
+	fprintf( stdout, "Remux(%d)\n", Threshold );
+	PCR_addr = (long long *)malloc( MAX_PCR*8 );
+	if( PCR_addr==NULL )
+	{
+	    fprintf( stdout, "Can't alloc PCR_addr\n" );
+	    exit( 1 );
+	}
+	PCR_data = (long long *)malloc( MAX_PCR*8 );
+	if( PCR_data==NULL )
+	{
+	    fprintf( stdout, "Can't alloc PCR_data\n" );
+	    exit( 1 );
+	}
+	PTS_addr = (long long *)malloc( MAX_PTS*8 );
+	if( PTS_addr==NULL )
+	{
+	    fprintf( stdout, "Can't alloc PTS_addr\n" );
+	    exit( 1 );
+	}
+	PTS_data = (long long *)malloc( MAX_PTS*8 );
+	if( PTS_data==NULL )
+	{
+	    fprintf( stdout, "Can't alloc PTS_data\n" );
+	    exit( 1 );
+	}
+	TS_addr = (long *)malloc( MAX_TS*8 );
+	if( TS_addr==NULL )
+	{
+	    fprintf( stdout, "Can't alloc TS_addr\n" );
+	    exit( 1 );
+	}
+	DATA_addr = (long long *)malloc( MAX_DATA*8 );
+	if( DATA_addr==NULL )
+	{
+	    fprintf( stdout, "Can't alloc DATA_addr\n" );
+	    exit( 1 );
+	}
+	DATA_pts  = (long long *)malloc( MAX_DATA*8 );
+	if( DATA_addr==NULL )
+	{
+	    fprintf( stdout, "Can't alloc DATA_pts\n" );
+	    exit( 1 );
+	}
+	NULL_addr = (long long *)malloc( MAX_NULL*8 );
+	if( NULL_addr==NULL )
+	{
+	    fprintf( stdout, "Can't alloc NULL_addr\n" );
+	    exit( 1 );
+	}
+
+	fprintf( stdout, "Copy to ts.bin with erasing ts file\n" );
+	if( ts_fp==NULL )
+	{
+	    fprintf( stdout, "Can't open ts.bin\n" );
+	    exit( 1 );
+	}
+	FILE *src_fp = fopen( srcFilename, "rb" );
+	if( src_fp==NULL )
+	{
+	    fprintf( stdout, 
+		"Remux(srcFilename) Can't open %s\n", srcFilename );
+	    exit( 1 );
+	}
+	FILE *outfile = fopen( outFilename, "wb" );
+	if( outfile==NULL )
+	{
+	    fprintf( stdout, "Remux(outfile) Can't open %s\n", outfile );
+	    exit( 1 );
+	}
+	int total = 0;
+#define TS_BUF_SIZE 188*1024
+	unsigned char TsBuffer[TS_BUF_SIZE];
+	unsigned char NullBuffer[192];
+	int size, readed, written;
+
+	// Extract ts
+	memset( NullBuffer, 0xFF, 192 );
+	NullBuffer[0] = 0x47;
+	NullBuffer[1] = 0x1F;
+	NullBuffer[2] = 0xFF;
+	NullBuffer[3] = 0x1F;
+	if( ReadAddrFile( textFilename, 
+		srcFilename, DATA_addr, NULL, &nDATA, MAX_DATA )<0 )
+	    exit( 1 );
+// -------------------------------------------------------------------
+// Copy XX.ts to ts.bin and overwrite with null packet
+// -------------------------------------------------------------------
+	for( index=0; index<nDATA; index++ )
+	{
+	    int ts_addr = DATA_addr[index];
+	    if( ts_addr>total )
+	    {
+//		fprintf( stdout, "Copy(%X:%X)\n", ts_addr-total, total );
+		while( total<ts_addr )
+		{
+		    int size = ts_addr-total;
+		    if( size>TS_BUF_SIZE )
+			size = TS_BUF_SIZE;
+		    readed = fread( TsBuffer, 1, size, src_fp );
+		    if( readed<size )
+		    {
+			fprintf( stdout, "readed=%d/%d@0x%X\n", 
+			    readed, size, total );
+			exit( 1 );
+		    }
+		    int rest = size;
+		    while( rest>0 )
+		    {
+			written = fwrite( TsBuffer, 1, rest, outfile );
+			if( written<1 )
+			{
+			    fprintf( stdout, "TsBuffer:written=%d/%d@0x%X\n", 
+				written, rest, total );
+			    exit( 1 );
+			}
+			rest -= written;
+		    }
+		    total += readed;
+		}
+	    }
+	    size = 188;
+//	    fprintf( stdout, "Write(%X:%X)\n", size, total );
+	    readed = fread( TsBuffer, 1, size, src_fp );
+	    if( readed<size )
+	    {
+		fprintf( stdout, "readed=%d/%d@0x%X\n", 
+		    readed, size, total );
+		exit( 1 );
+	    }
+	    written = fwrite( TsBuffer, 1, size, ts_fp );
+	    if( written<size )
+	    {
+		fprintf( stdout, "TsBuffer:written=%d/%d@0x%X\n", 
+		    written, size, total );
+		exit( 1 );
+	    }
+	    written = fwrite( NullBuffer, 1, size, outfile );
+	    if( written<size )
+	    {
+		fprintf( stdout, "NullBuffer:written=%d/%d@0x%X\n", 
+		    written, size, total );
+		exit( 1 );
+	    }
+	    total += readed;
+	}
+	// Rest
+	{
+	    size = TS_BUF_SIZE;
+	    while( written>0 )
+	    {
+		readed = fread( TsBuffer, 1, size, src_fp );
+		written = fwrite( TsBuffer, 1, readed, outfile );
+	    }
+	}
+	fclose( src_fp );
+	fclose( outfile );
+	fclose( ts_fp );
+
+	fprintf( stdout, "Copy done\n" );
+
+	fprintf( stdout, "nTS=%d\n", nTS );
+
+#if 0
+	TS_addr_Dump( TS_addr, nTS );
+#endif
+// ----------------------------------------------------------
+//  Read PTS file
+// ----------------------------------------------------------
+	// PTS
+	fprintf( stdout, "Read pts file\n" );
+	while( 1 )
+	{
+	    if( fgets( (char *)TsBuffer, 1024, pts_fp )==NULL )
+	    {
+	    	fprintf( stdout, "EOF\n" );
+		break;
+	    }
+	    int addr1, ptsAddr;
+	    int ptsH, ptsL;
+	    int dtsH, dtsL;
+	    sscanf( (char *)TsBuffer, "%X %X : %X %X, %X %X",
+	    	&addr1, &ptsAddr, &ptsH, &ptsL, &dtsH, &dtsL );
+	    PTS_addr[nPTS] = ptsAddr;
+	    PTS_data[nPTS] = ptsL;
+	    nPTS++;
+	    if( nPTS>=MAX_PTS )
+	    {
+	    	fprintf( stdout, "Too many PTS (%d)\n", nPTS );
+		exit( 1 );
+	    }
+//	    fprintf( stdout, "%8X : %8X\n", addr2, ptsL );
+	}
+	fprintf( stdout, "Read done\n" );
+
+// ----------------------------------------------------------
+//  Read PCR file
+// ----------------------------------------------------------
+	fprintf( stdout, "Read PCR file\n" );
+	FILE *pcr_fp = fopen( "PCR.txt", "r" );
+	if( pcr_fp==NULL )
+	{
+	    fprintf( stdout, "Can't open PCR.txt\n" );
+	    exit( 1 );
+	}
+	while( 1 )
+	{
+	    if( fgets( (char *)TsBuffer, 1024, pcr_fp )==NULL )
+	    {
+	    	fprintf( stdout, "EOF\n" );
+		break;
+	    }
+	    int addr, pid, pcrH, pcrL;
+	    long long PCR;
+	    sscanf( (char *)TsBuffer, "%X : %X : %X,%X %llX",
+	    	&addr, &pid, &pcrH, &pcrL, &PCR );
+	    PCR_addr[nPCR] = addr;
+	    PCR_data[nPCR] = PCR;
+	    nPCR++;
+	    if( nPCR>=MAX_PCR )
+	    {
+	    	fprintf( stdout, "Too many PCR (%d)\n", nPCR );
+		exit( 1 );
+	    }
+//	    fprintf( stdout, "%8X : %9llX\n", addr, PCR );
+	}
+	fclose( pcr_fp );
+	fprintf( stdout, "Read done\n" );
+
+	// NULL(PID=0x1FFF) data
+	if( ReadAddrFile( "PES-1FFF.txt", 
+		srcFilename, NULL_addr, NULL, &nNULL, 
+		MAX_NULL )<0 )
+	    exit( 1 );
+#if 0
+	TS_addr_Dump( TS_addr, nTS );
+#endif
+#if 1
+	int nD=0, nN=0;
+	long long DataAddr, NullAddr;
+	for( n=0; ; n++ )
+	{
+	    if( (nD>=nDATA) && (nN>=nNULL) )
+	    	break;
+	    if( nD<nDATA )
+	    	DataAddr = DATA_addr[nD];
+	    else
+	    	DataAddr = 0xFFFFFFFFFFll;
+	    if( nN<nNULL )
+	    	NullAddr = NULL_addr[nN];
+	    else
+	    	NullAddr = 0xFFFFFFFFFFll;
+	    if( DataAddr<NullAddr )
+	    {
+	    	TS_addr[nTS] = DataAddr;
+		nD++;
+	    } else if( DataAddr>NullAddr )
+	    {
+	    	TS_addr[nTS] = NullAddr;
+		nN++;
+	    } else
+	    	break;
+//	    fprintf( stdout, "%5d : %8X\n", nTS, TS_addr[nTS] );
+	    nTS++;
+	}
+#else
+	// Full Sort
+	fprintf( stdout, "nTS=%d\n", nTS );
+	// Sort
+	for( n=0; n<(nTS-2); n++ )
+	{
+	    int updated=0;
+	    for( i=0; i<(nTS-2-n); i++ )
+	    {
+		if( TS_addr[i]>TS_addr[i+1] )
+		{
+		    unsigned long tmp = TS_addr[i];
+#if 0
+		    fprintf( stdout, "Swap(%d:%d,%d)\n",
+		    	i, TS_addr[i], TS_addr[i+1] );
+#endif
+		    TS_addr[i+0] = TS_addr[i+1];
+		    TS_addr[i+1] = tmp;
+		    updated++;
+		}
+	    }
+	    if( updated==0 )
+		break;
+	}
+#endif
+#if 0
+	TS_addr_Dump( TS_addr, nTS );
+#endif
+	fprintf( stdout, "Update\n" );
+	// Make TS_addr and PCR
+	int nPcr=0;
+	unsigned long long PCR = PCR_data[0];
+	n=0;
+	int pk, pt=0;
+	int nFree=0;
+	long long PTS = PTS_data[0];
+	int fd;
+	int mapSize = 4096*2;
+	ts_fp = fopen( "ts.bin", "rb" );
+	if( ts_fp==NULL )
+	{
+	    fprintf( stdout, "Can't open ts.bin\n" );
+	    exit( 1 );
+	}
+	fd = open( outFilename, O_RDWR );
+	if( fd==(-1) )
+	{
+	    fprintf( stdout, 
+	    "Remux(outFilename) Can't open %s\n", outFilename );
+	    exit( 1 );
+	}
+	unsigned long WrAddr = 0;
+	int nCont=0;
+	int L_Free=(-2);
+	for( pk=0; pk<nDATA; pk++ )
+	{
+	    fprintf( stdout, "DATA(%6d): %8X : ", pk, DATA_addr[pk] );
+	    while( (PTS_addr[pt]-0x20)<DATA_addr[pk] )
+	    {
+		pt++;
+		if( pt>=nPTS )
+		    break;
+		PTS = PTS_data[pt];
+//		fprintf( stdout, "%8X %9llX\n", PTS_addr[pt], PTS );
+	    }
+//	    fprintf( stdout, "PTS=%9llX (%llX)\n", PTS, PTS-90000 );
+	    fprintf( stdout, "PTS=%9llX (%llX)\n", PTS, PTS-Threshold );
+	    // Search free ts area
+	    while( 1 )
+	    {
+		if( nFree>=nTS )
+		{
+		    fprintf( stdout, "No more free area (%d)\n", nFree );
+		    break;
+		}
+//		fprintf( stdout, "%6d : %10d : ", nFree, TS_addr[nFree] );
+		while( PCR_addr[nPcr]<TS_addr[nFree] )
+		{
+#if 0
+		    fprintf( stdout, 
+			"nPcr=%5d, PCR_addr=%8X, TS_addr=%8X\n",
+				nPcr, PCR_addr[nPcr], TS_addr[nFree] );
+#endif
+		    nPcr++;
+		    if( nPcr>=nPCR )
+			break;
+		    PCR = PCR_data[nPcr];
+		}
+//		fprintf( stdout, "%9llX\n", PCR );
+#if 0
+	    	fprintf( stdout, "nFree=%d, nPcr=%5d, nPCR=%5d, PCR=%9llX\n", 
+			nFree, nPcr, nPCR, PCR );
+		fflush( stdout );
+#endif
+		if( PCR>=(PTS-Threshold) )
+		{
+		    fprintf( stdout, "TS(%6d) : %9llX : ", 
+		    	nFree, TS_addr[nFree] );
+		    fprintf( stdout, "PCR=%9llX\n", PCR );
+		    if( (nFree-L_Free)==1 )
+		    	nCont++;
+		    else
+		    	nCont=0;
+		    L_Free = nFree;
+//		    if( nCont>128 )
+		    if( nCont>32 )
+		    {
+		    	fprintf( stdout, "Insert (nCont=%d)\n", nCont );
+		    	nFree++;
+		    }
+		    WrAddr = TS_addr[nFree];
+		    nFree++;
+		    break;
+		}
+		nFree++;
+	    }
+	    {
+		unsigned char *data;
+	    // mmap
+		data = (unsigned char *)mmap( (caddr_t)0, mapSize, 
+				    PROT_READ | PROT_WRITE, MAP_SHARED,
+				    fd, WrAddr & 0xFFFFF000 );
+		if( data==(unsigned char *)-1) 
+		{
+		    fprintf( stdout, "Can't mmap\n" );
+		    exit( 1 );
+		}
+		int offset = WrAddr & 0xFFF;
+		unsigned char *ptr = &data[WrAddr & 0xFFF];
+#if 0
+		fprintf( stdout, "Write(%8X:%8X)\n", 
+			WrAddr & 0xFFFFF000,
+			offset );
+#endif
+		readed = fread( ptr, 1, 188, ts_fp );
+		if( readed<188 )
+		{
+			fprintf( stdout, "readed=%d\n", readed );
+		}
+	    // munmap
+		if( munmap( data, mapSize )==(-1) )
+		{
+		    fprintf( stdout, "Can't munmap\n" );
+		    exit( 1 );
+		}
+	    }
+	}
+	close( fd );
+	fclose( ts_fp );
+	fprintf( stdout, "done\n" );
+
+	fprintf( stdout, "nFree=%d, nTS=%d\n", nFree, nTS );
+
+	return 0;
+}
+
+
+#define MODE_MPG	0
+#define MODE_AVC	1
+#define MODE_HEADER	2
+#define MODE_REMUX	3
+
+int main( int argc, char *argv[] )
+{
+int i;
+char *filename = NULL;
+int args=0;
+FILE *bin_fp = NULL;
+FILE *pts_fp = NULL;
+unsigned char buffer[BUF_SIZE];
+int ID, len;
+int addr=0;
+int Error=0;
+int nItem = (-1);
+int readed, written;
+int mode = MODE_MPG;
+int bEditDirect=0;
+int Threshold=90000;	// 1sec
+
+	for( i=0; i<(MAX_PACKETS+4); i++ )
+	{
+	    Packets[i] = 0;
+	}
+	Packets[MAX_PACKETS+0] = 0x12345678;
+	Packets[MAX_PACKETS+1] = 0x9ABCDEF0;
+#if 0
+	for( i=0; i<ADDR_MAX; i++ )
+	{
+	    Addr[i] = -1;
+	}
+#endif
+	for( i=0; i<ID_MAX; i++ )
+	{
+	    items[i] = 0;
+	    value[i] = (-1);
+	}
+	for( i=0; i<MAX_UPDATE; i++ )
+	{
+	    g_update_addr[i] = 0xFFFFFFFF;
+	    g_update_bits[i] = 0;
+	    g_update_size[i] = 0;
+	    g_update_data[i] = 0;
+	}
+	for( i=1; i<argc; i++ )
+	{
+	    if( argv[i][0]=='-' )
+	    {
+	    	switch( argv[i][1] )
+		{
+		case 'N' :
+		    bNoDump = 1;
+		    bShowDetail=0;
+		    bShowNALinfo=0;
+		case 'D' :
+		    bDump = 1;
+		    break;
+		case 'W' :
+		    bShow = 1;
+		    break;
+		case 'E' :
+		    bSkipError=1;
+		    break;
+		case 'A' :
+		    mode = MODE_AVC;
+		    break;
+		case 'H' :
+		    mode = MODE_HEADER;
+		    break;
+		case 'V' :
+		    bDebug = 1;
+		    break;
+		case 'S' :
+		    bDumpSequenceDisplayExtension = 1;
+		    bDumpSequenceExtension = 1;
+		    bDumpSequence = 1;
+		    break;
+		case 'a' :
+		    bUseAddrFile = 0;
+		    fprintf( stdout, "bUseAddrFile=%d\n", bUseAddrFile );
+		    break;
+		case 'T' :
+		    bDisplayTS = 1;
+		    break;
+		case 's' :
+		    bDumpSlice = 1;
+		    break;
+		case 'C' :
+		    nSelSt = atoi( &argv[i][2] );
+		    break;
+		case 'c' :
+		    nSelEn = atoi( &argv[i][2] );
+		    break;
+		case 'I' :
+		    {
+			int j;
+		    	int id=(-1);
+			char *keyword = &argv[i][2];
+			int len = strlen(keyword);
+		    	for( j=0; headerItem[j].id>=0; j++ )
+			{
+#if 0
+			    fprintf( stdout, "%d:%s,%d\n",
+			    	j, headerItem[j].name, headerItem[j].id );
+#endif
+			    if( strncmp( keyword, headerItem[j].name, len )==0 )
+			    {
+				id = headerItem[j].id;
+				break;
+			    }
+			}
+			if( id<0 )
+			{
+			    fprintf( stdout, "id(%s) not found\n", keyword );
+			    EXIT();
+			} else {
+			    fprintf( stdout, "%s = %d\n", keyword, id );
+			}
+			nItem = id;
+			items[nItem]++;
+			fprintf( stdout, "items[%d]=%d\n", 
+			    nItem, items[nItem] );
+		    }
+		    break;
+		case 'p' :
+		    fromPts = GetValue( &argv[i][2], Error );
+		    break;
+		case 'd' :
+		    fromDts = GetValue( &argv[i][2], Error );
+		    break;
+		case 'i' :
+		    if( nItem>=0 )
+		    {
+			value[nItem] = GetValue( &argv[i][2], Error );
+			fprintf( stdout, "value[%d] = %d\n", 
+				nItem, value[nItem] );
+		    }
+		    break;
+		default :
+		    fprintf( stdout, "Unknown parameter %s\n", argv[i] );
+		    exit( 1 );
+		}
+	    } else if( argv[i][0]=='+' )
+	    {
+	    	switch( argv[i][1] )
+		{
+		case 'S' :
+		    // make timing_info_present_flag=0 and remove timing_info
+		    bRemoveTimingInfo = 1;
+		    fprintf( stdout, "RemoveTimingInfo\n" );
+		    break;
+		case 'P' :
+		    PtsOffset = atoi( &argv[i][2] );
+		    fprintf( stdout, "PtsOffset=%d\n", PtsOffset );
+		    bShowDetail = 0;
+		    break;
+		case 'p' :
+		    toPts = GetValue( &argv[i][2], Error );
+		    break;
+		case 'd' :
+		    toDts = GetValue( &argv[i][2], Error );
+		    break;
+		case 'D' :
+		    DtsOffset = atoi( &argv[i][2] );
+		    fprintf( stdout, "DtsOffset=%d\n", DtsOffset );
+		    bShowDetail = 0;
+		    break;
+		case 'E' :
+		    bEditDirect = 1;
+		    fprintf( stdout, "bEditDirect=%d\n", bEditDirect );
+		    break;
+		case 'R' :
+		    fprintf( stdout, "Remux\n" );
+		    mode = MODE_REMUX;
+		    Threshold = atoi( &argv[i][2] );
+		    if( Threshold<1 )
+		    	Threshold=90000;	// 1sec
+		    break;
+		case 'Z' :
+		    bShowDetail = 1;
+		    break;
+		default :
+		    fprintf( stdout, "Unknown parameter %s\n", argv[i] );
+		    exit( 1 );
+		}
+	    } else {
+	    	switch( args )
+		{
+		case 0 :
+		    filename = argv[i];
+		    break;
+		case 1 :
+		    break;
+		}
+	    }
+	}
+
+	if( filename==NULL )
+	{
+	    Usage( argv[0] );
+	}
+	char srcFilename[1024];
+	char binFilename[1024];
+	char txtFilename [1024];
+	char ptsFilename[1024];
+	char outFilename[1024];
+	snprintf( binFilename, 1023, "%s.bin", filename );
+	snprintf( txtFilename, 1023, "%s.txt", filename );
+	snprintf( ptsFilename, 1023, "%s.pts", filename );
+
+	bin_fp = fopen( binFilename, "rb" );
+	if( bin_fp==NULL )
+	{
+	    fprintf( stdout, "binFilename : Can't open %s\n", binFilename );
+	    exit( 1 );
+	}
+	if( mode==MODE_REMUX )
+	{
+	    pts_fp = fopen( ptsFilename, "r" );
+	    if( pts_fp==NULL )
+	    {
+		fprintf( stdout, "ptsFilename : Can't read %s\n", ptsFilename );
+		exit( 1 );
+	    }
+	} else {
+	    pts_fp = fopen( ptsFilename, "w" );
+	    if( pts_fp==NULL )
+	    {
+		fprintf( stdout, 
+			"ptsFilename : Can't write %s\n", ptsFilename );
+		exit( 1 );
+	    }
+	}
+	// --------------------------------------------------------
+	// Read Address table
+	initTsAddr( );
+	if( bUseAddrFile )
+	{
+	    int nTS=0;
+	    if( ReadAddrFile( txtFilename, 
+	    	srcFilename, TsAddr, PesAddr,
+	    	&nTS, ADDR_MAX )<0 )
+		exit( 1 );
+	}
+	// --------------------------------------------------------
+	//  Analyze
+#if 0
+	g_update_addr[g_update_count] = 0x1D8E654;
+	g_update_bits[g_update_count] = 32;
+	g_update_size[g_update_count] = 14;
+	g_update_data[g_update_count] = 712;
+	g_update_count++;
+
+	g_update_addr[g_update_count] = 0x1D8E654;
+	g_update_bits[g_update_count] = 47;
+	g_update_size[g_update_count] = 14;
+	g_update_data[g_update_count] = 478;
+	g_update_count++;
+
+	g_update_addr[g_update_count] = 0x1DDABBE;
+	g_update_bits[g_update_count] = 0x00;
+	g_update_size[g_update_count] = 12;
+	g_update_data[g_update_count] = 712;
+	g_update_count++;
+#else
+	switch( mode )
+	{
+	case MODE_HEADER :
+	    AnalyzeHeader( bin_fp, pts_fp );
+	    break;
+	case MODE_MPG :
+	    AnalyzeMPG( bin_fp, pts_fp );
+	    break;
+	case MODE_AVC :
+	    AnalyzeAVC( bin_fp, pts_fp );
+	    break;
+	case MODE_REMUX :
+	    sprintf( outFilename, "%s-", srcFilename );
+	    Remux( srcFilename, outFilename, txtFilename, pts_fp, Threshold );
+	    break;
+	default :
+	    fprintf( stdout, "Unknown format (%d)\n", mode );
+	    exit( 1 );
+	    break;
+	}
+#endif
+	if( bin_fp )
+	{
+	    fclose( bin_fp );
+	    bin_fp = NULL;
+	}
+	if( pts_fp )
+	{
+	    fclose( pts_fp );
+	    pts_fp = NULL;
+	}
+
+	// Make updated file
+	int j, n;
+	if( g_update_count>0 )
+	{
+	    fprintf( stdout, 
+	    	"----------------------------------------------\n" );
+	    fprintf( stdout, "g_update_count =%d\n", g_update_count );
+	    fprintf( stdout, "g_update_countS=%d\n", g_update_countS );
+	    fprintf( stdout, "Now swap\n" );
+	    for( j=0; j<(g_update_count-0); j++ )
+	    {
+		int bSwapped=0;
+		for( i=0; i<j; i++ )
+		{
+		    int bit1 = g_update_addr[i+0]*8+g_update_bits[i+0];
+		    int bit2 = g_update_addr[i+1]*8+g_update_bits[i+1];
+		    if( bit1>bit2 )
+		    {
+			swap( &g_update_addr[i+0], &g_update_addr[i+1] );
+			swap( &g_update_bits[i+0], &g_update_bits[i+1] );
+			swap( &g_update_size[i+0], &g_update_size[i+1] );
+			swap( &g_update_data[i+0], &g_update_data[i+1] );
+			bSwapped++;
+		    }
+		}
+		if( bSwapped==0 )
+		    break;
+	    }
+	    for( n=0; n<g_update_count; n++ )
+	    {
+		    fprintf( stdout, "update 0x%X,%d,%d,%d\n",
+			g_update_addr[n],
+			g_update_bits[n],
+			g_update_size[n],
+			g_update_data[n] );
+	    }
+	}
+
+	if( (g_update_count>0) || (g_update_countS>0) )
+	{
+	    if( bEditDirect==0 )
+	    {
+		sprintf( outFilename, "%s-", srcFilename );
+		FILE *src_fp = fopen( srcFilename, "rb" );
+		if( src_fp==NULL )
+		{
+		    fprintf( stdout, 
+		    "srcFilename : Can't open %s\n", srcFilename );
+		    exit( 1 );
+		}
+		FILE *outfile = fopen( outFilename, "wb" );
+		if( outfile==NULL )
+		{
+		    fprintf( stdout, "outfile : Can't open %s\n", outfile );
+		    exit( 1 );
+		}
+		fprintf( stdout, "Copy %s to %s\n", srcFilename, outFilename );
+		CopyFile( src_fp, outfile, -1 );
+
+		fclose( src_fp );
+		fclose( outfile );
+	    } else {
+		sprintf( outFilename, "%s", srcFilename );
+	    }
+	    // ------------------------------------------------
+	    int fd;
+	    int n;
+	    int mapSize = 4096*2;
+	    fprintf( stdout, "Update %s\n", outFilename );
+	    fd = open( outFilename, O_RDWR );
+	    if( fd==(-1) )
+	    {
+	    	fprintf( stdout, "outFilename : Can't open %s\n", outFilename );
+		exit( 1 );
+	    }
+	    unsigned char *data;
+	    // Update Bits
+	    for( n=0; n<g_update_count; n++ )
+	    {
+		fprintf( stdout, "addr=%8X, bits=%X : ",
+		    g_update_addr[n], g_update_bits[n] );
+
+		addr = SrcAddr(g_update_addr[n] + g_update_bits[n]/8);
+		g_update_bits[n]=g_update_bits[n]%8;
+
+		fprintf( stdout, "addr=%8X, bits=%X\n",
+		    addr, g_update_bits[n] );
+	    // mmap
+		data = (unsigned char *)mmap( (caddr_t)0, mapSize, 
+				    PROT_READ | PROT_WRITE, MAP_SHARED,
+				    fd, addr & 0xFFFFF000 );
+		if( data==(unsigned char *)-1) 
+		{
+		    fprintf( stdout, "Can't mmap\n" );
+		    exit( 1 );
+		}
+	    // update data
+		{
+		    unsigned char *ubuffer =
+			    (unsigned char *)(data+(addr & 0x0FFF));
+		    UpdateBits( ubuffer, 
+			g_update_bits[n], g_update_size[n], g_update_data[n] );
+		}
+	    // munmap
+		if( munmap( data, mapSize )==(-1) )
+		{
+		    fprintf( stdout, "Can't munmap\n" );
+		    exit( 1 );
+		}
+	    }
+	    // Special Update
+	    for( n=0; n<g_update_countS; n++ )
+	    {
+		int bit;	
+		fprintf( stdout, "=== %d\n", n );
+		fprintf( stdout, 
+		    "Special : addr=%8X, bits=%d, %d, %d (mode=%d)\n",
+		    g_update_addrS[n], 
+		    g_update_bit_S[n],
+		    g_update_bit_E[n],
+		    g_update_bit_T[n],
+		    g_update_mode [n]
+		    );
+	    // mmap
+		addr = SrcAddr(g_update_addrS[n]);
+		data = (unsigned char *)mmap( (caddr_t)0, mapSize, 
+				    PROT_READ | PROT_WRITE, MAP_SHARED,
+				    fd, addr & 0xFFFFF000 );
+		if( data==(unsigned char *)-1) 
+		{
+		    fprintf( stdout, "Can't mmap\n" );
+		    exit( 1 );
+		}
+#if 1
+		fprintf( stdout, "addr=%X\n", addr );
+		int j;
+		for( j=0; j<16; j++ )
+		{
+		    fprintf( stdout, "%4d : ", (j*16+0)*8 );
+		    for( i=0; i<16; i++ )
+		    {
+			int b = ReadByte( data, addr, (j*16+i)*8 );
+			fprintf( stdout, "%02X ", b );
+		    }
+		    fprintf( stdout, "\n" );
+		}
+#endif
+		if( g_update_mode[n]==EDIT_CUT )
+		{
+		    // S,E,T : S<-E
+		    for( bit=g_update_bit_E[n]; bit<g_update_bit_T[n]; bit++ )
+		    {
+			fprintf( stdout, "addr=%8X, bits=%d\n", addr, bit );
+			int b, dst_bit;
+			dst_bit = g_update_bit_S[n]+bit-g_update_bit_E[n];
+			b = ReadBit( data, addr, bit );
+			WriteBit( data, addr, dst_bit, b );
+			fprintf( stdout, "%4X,%3d : %d : %4X,%3d : %02X\n",
+			    addr, bit, b, addr, dst_bit,
+			    ReadByte( data, addr, dst_bit ) );
+		    }
+		    for( bit=g_update_bit_S[n]
+		    	    +g_update_bit_T[n]-g_update_bit_E[n];
+			    bit<=g_update_bit_T[n]; bit++ )
+		    {
+			WriteBit( data, addr, bit, 0 );
+		    }
+		} else if( g_update_mode[n]==EDIT_INS )
+		{
+		    // S,E,T : S->E
+//		    for( bit=g_update_bit_E[n]; bit<g_update_bit_T[n]; bit++ )
+		    for( bit=g_update_bit_T[n]-1; 
+		    	bit>=g_update_bit_E[n]; bit-- )
+		    {
+			fprintf( stdout, "addr=%8X, bits=%d\n", addr, bit );
+			int b, dst_bit;
+			dst_bit = g_update_bit_S[n]+bit-g_update_bit_E[n];
+			b = ReadBit( data, addr, bit );
+			WriteBit( data, addr, dst_bit, b );
+			fprintf( stdout, "%4X,%3d : %d : %4X,%3d : %02X\n",
+			    addr, bit, b, addr, dst_bit,
+			    ReadByte( data, addr, dst_bit ) );
+		    }
+		}
+	    // munmap
+		if( munmap( data, mapSize )==(-1) )
+		{
+		    fprintf( stdout, "Can't munmap\n" );
+		    exit( 1 );
+		}
+	    }
+	    close( fd );
+	}
+	fprintf( stdout, "Packets[MAX_PACKETS+0] = %8X\n", 
+		Packets[MAX_PACKETS+0] );
+	fprintf( stdout, "Packets[MAX_PACKETS+1] = %8X\n", 
+		Packets[MAX_PACKETS+1] );
+	for( i=0; i<MAX_PACKETS; i++ )
+	{
+	    if( Packets[i]>0 )
+	    {
+		fprintf( stdout, "Packet[%04X] = %d\n", i, Packets[i] );
+	    }
+	}
+	for( i=0; i<256; i++ )
+	{
+	    if( Counts[i]>0 )
+	    {
+		fprintf( stdout, "Counts[%04X] = %d\n", i, Counts[i] );
+	    }
+	}
+}
+

@@ -1,0 +1,916 @@
+
+/*
+	pes2tts.cpp
+		2013.7.31  by T.Oda
+
+		2013.11.29 : rate may be small in some stream
+			start rate modified
+		2013.12. 5 : Video and Audio
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>	// memset
+
+#include "tsLib.h"
+#include "parseLib.h"
+
+#include "main.h"
+
+static int bDisplay=0;
+static int AudioCodec=0;
+
+#define TABLE_UNIT	8
+
+//int *Table[MAX_FILE];
+// Table[0]=DTS
+// Table[1]=PTS
+// Table[2]=head_addr
+// Table[3]=head_addr-l_head_addr
+// Table[4]=DTS'-packet*188*90/rate
+// Table[5]=DTS'
+// Table[6]=space
+int DumpTable( int *Table[], int nfile, int n, int diff )
+{
+	fprintf( stdout, 
+	    "%5d : %8X %8X %8X %8X : %8X %8X :%3d (%7d)\n",
+		n, 
+		Table[nfile][n*TABLE_UNIT+0], 
+		Table[nfile][n*TABLE_UNIT+1], 
+		Table[nfile][n*TABLE_UNIT+2], 
+		Table[nfile][n*TABLE_UNIT+3],
+		Table[nfile][n*TABLE_UNIT+4], 
+		Table[nfile][n*TABLE_UNIT+5],
+		Table[nfile][n*TABLE_UNIT+6],
+		diff
+	    );
+}
+
+int Pes2Tts( FILE *infile, unsigned int off, 
+	unsigned int sz, 
+	unsigned int PCR, 
+	int *nPacket,
+	FILE *outfile, int Pid, int rateKB, int bPCR, int bPAT )
+{
+int s;
+int written;
+unsigned char packet[192];
+int PcrPid=0x101;
+	fseek( infile, off, SEEK_SET );
+unsigned int nPCR = PCR*300;	// 90kHz->27MHz
+#if 0
+	fprintf( stdout, "-------------\n" );
+	fprintf( stdout, "PCR=%X(%X)\n", PCR, nPCR );
+#endif
+	fprintf( stdout, "Pes2Tts(%04X:%8X:%d,%d)%8X\n", 
+		Pid, PCR, bPCR, bPAT, nPCR );
+	// --------------------------------
+	// PCR packet
+	memset( packet, 0, 192 );
+	unsigned char *byteS = &packet[4];
+	packet[0] = (nPCR>>24)&0xFF;
+	packet[1] = (nPCR>>16)&0xFF;
+	packet[2] = (nPCR>> 8)&0xFF;
+	packet[3] = (nPCR>> 0)&0xFF;
+
+	byteS[0] = 0x47;
+	byteS[1] = (PcrPid>>8)&0x1F;
+	byteS[2] = (PcrPid>>0)&0xFF;
+	byteS[3] = 0x20;	// adapt+no payload
+
+	byteS[4] = 0x07;	// adapt_len
+	byteS[5] = 0x10;	// bPCR=1
+	unsigned int nPCR_H = (PCR>>17);
+	unsigned int nPCR_L = (PCR<<15) & 0xFFFF8000;
+	byteS[ 6] = (nPCR_H>> 8)&0xFF;
+	byteS[ 7] = (nPCR_H>> 0)&0xFF;
+	byteS[ 8] = (nPCR_L>>24)&0xFF;
+	byteS[ 9] = (nPCR_L>>16)&0xFF;
+	byteS[10] = (nPCR_L>> 8)&0xFF;
+	byteS[11] = (nPCR_L>> 0)&0xFF;
+
+	if( bPCR )
+	{
+#if 0
+	    fprintf( stdout, "%02X %02X : %02X %02X %02X %02X\n",
+	    	byteS[6], byteS[7], byteS[8], byteS[9], byteS[10], byteS[11] );
+#endif
+	    written = fwrite( packet, 1, 192,  outfile );
+	}
+
+	if( bPAT )
+	{
+	    // --------------------------------
+	    // PAT packet
+	    int PatPid=0x000;
+	    memset( packet, 0xFF, 192 );
+	    nPCR = nPCR + 27000*188/rateKB;
+	    packet[0] = (nPCR>>24)&0xFF;
+	    packet[1] = (nPCR>>16)&0xFF;
+	    packet[2] = (nPCR>> 8)&0xFF;
+	    packet[3] = (nPCR>> 0)&0xFF;
+
+	    byteS[ 0] = 0x47;
+	    byteS[ 1] = ((PatPid>>8)&0x1F) | 0x40;
+	    byteS[ 2] =  (PatPid>>0)&0xFF;
+	    byteS[ 3] = 0x10;	// no adapt+payload
+
+	    byteS[ 4] = 0x00;
+	    byteS[ 5] = 0x00;
+	    byteS[ 6] = 0xB0;
+	    byteS[ 7] = 0x0D;
+	    byteS[ 8] = 0x00;
+	    byteS[ 9] = 0x00;
+	    byteS[10] = 0xC1;
+	    byteS[11] = 0x00;
+	    byteS[12] = 0x00;
+	    byteS[13] = 0x00;
+	    byteS[14] = 0x01;
+	    byteS[15] = 0xE1;
+	    byteS[16] = 0x00;
+	    byteS[17] = 0xB3;
+	    byteS[18] = 0x58;
+	    byteS[19] = 0x82;
+	    byteS[20] = 0xB7;
+	    written = fwrite( packet, 1, 192,  outfile );
+
+	    // --------------------------------
+	    // PMT packet
+	    int PmtPid=0x100;
+	    memset( packet, 0xFF, 192 );
+	    nPCR = nPCR + 27000*188/rateKB;
+	    packet[0] = (nPCR>>24)&0xFF;
+	    packet[1] = (nPCR>>16)&0xFF;
+	    packet[2] = (nPCR>> 8)&0xFF;
+	    packet[3] = (nPCR>> 0)&0xFF;
+
+	    byteS[ 0] = 0x47;
+	    byteS[ 1] = ((PmtPid>>8)&0x1F) | 0x40;
+	    byteS[ 2] =  (PmtPid>>0)&0xFF;
+	    byteS[ 3] = 0x10;	// no adapt+payload
+
+	    if( AudioCodec==1 )	// AC3
+	    {
+		byteS[ 4] = 0x00;
+		byteS[ 5] = 0x02;
+		byteS[ 6] = 0xB0;
+		byteS[ 7] = 0x1F;	//
+		byteS[ 8] = 0x00;
+		byteS[ 9] = 0x01;
+		byteS[10] = 0xC1;
+		byteS[11] = 0x00;
+		byteS[12] = 0x00;
+		byteS[13] = 0xE1;
+		byteS[14] = 0x01;
+		byteS[15] = 0xF0;
+		byteS[16] = 0x00;
+		byteS[17] = 0x1B;
+		byteS[18] = 0xE2;
+		byteS[19] = 0x00;
+		byteS[20] = 0xF0;
+		byteS[21] = 0x00;
+		byteS[22] = 0x81;	//
+		byteS[23] = 0xE2;
+		byteS[24] = 0x01;
+		byteS[25] = 0xF0;
+		byteS[26] = 0x08;
+		byteS[27] = 0x81;
+		byteS[28] = 0x06;
+		byteS[29] = 0x08;
+		byteS[30] = 0x38;
+
+		byteS[31] = 0x0F;
+		byteS[32] = 0xFF;
+		byteS[33] = 0xEF;
+		byteS[34] = 0x01;
+		byteS[35] = 0x68;
+		byteS[36] = 0x09;
+		byteS[37] = 0x26;
+		byteS[38] = 0xF6;
+	    } else {
+		byteS[ 4] = 0x00;
+		byteS[ 5] = 0x02;
+		byteS[ 6] = 0xB0;
+		byteS[ 7] = 0x17;
+		byteS[ 8] = 0x00;
+		byteS[ 9] = 0x01;
+		byteS[10] = 0xC1;
+		byteS[11] = 0x00;
+		byteS[12] = 0x00;
+		byteS[13] = 0x00;
+		byteS[14] = 0xE1;
+		byteS[15] = 0xF0;
+		byteS[16] = 0x00;
+		byteS[17] = 0x1B;
+		byteS[18] = 0xE2;
+		byteS[19] = 0x00;
+		byteS[20] = 0xF0;
+		byteS[21] = 0x00;
+		byteS[22] = 0x03;
+		byteS[23] = 0xE2;
+		byteS[24] = 0x01;
+		byteS[25] = 0xF0;
+		byteS[26] = 0x00;
+		byteS[27] = 0xD4;
+		byteS[28] = 0x4A;
+		byteS[29] = 0x3A;
+		byteS[30] = 0x68;
+	    }
+	    written = fwrite( packet, 1, 192,  outfile );
+	}
+
+	// --------------------------------
+	for( s=0; s<sz; s+=184 )
+	{
+	    int readSize=sz-s;
+	    if( readSize>184 )
+	    	readSize=184;
+	    memset( packet, 0, 192 );
+//	    fprintf( stdout, "nPCR=%8X\n", nPCR );
+	    nPCR = nPCR + 27000*188/rateKB;
+	    packet[0] = (nPCR>>24)&0xFF;
+	    packet[1] = (nPCR>>16)&0xFF;
+	    packet[2] = (nPCR>> 8)&0xFF;
+	    packet[3] = (nPCR>> 0)&0xFF;
+/*
+	    PID = ((bytes[1]<<8) | (bytes[2]<<0)) & 0x1FFF;
+//	    int ts_error     = (bytes[1]>>7)&1;
+	    int payloadStart = (bytes[1]>>6)&1;
+//	    int ts_priority  = (bytes[1]>>5)&1;
+	    int adapt = (bytes[3]>>4)&3;
+	    int count = bytes[3]&15;
+	    int adapt_len = bytes[4];
+	    	switch( adapt )
+		{
+		case 0 :	// ?
+		    fprintf( stdout, "adapt=%d\n", adapt );
+		    break;
+		case 1 :	// no adapt
+		    bPayload[PID]=1;
+		    bAdapt  =0;
+		    break;
+		case 2 :	// adapt
+		    bPayload[PID]=0;
+		    bAdapt  =1;
+		    break;
+		case 3 :	// adapt+payload
+		    bPayload[PID]=1;
+		    bAdapt  =1;
+		    break;
+		}
+*/
+	    int head=4;
+	    byteS[0] = 0x47;
+	    byteS[1] = (Pid>>8)&0x1F;
+	    byteS[2] = (Pid>>0)&0xFF;
+	    byteS[3] = 0x10 | ((*nPacket)&0xF);
+	    if( readSize<=182 )
+	    {
+	    	head = 188-readSize;
+		byteS[3] |= 0x20;	// Adaptation field
+		byteS[4] =  head-5;	// Adaptation length
+		byteS[5] =  0x00;	// no PCR
+	    } else if( readSize<184 )
+	    {
+//	    	fprintf( stdout, "readSize=%d\n", readSize );
+	    	head = 188-readSize;
+		byteS[3] |= 0x20;	// Adaptation field
+		byteS[4] =  head-5;	// Adaptation length
+	    }
+	    if( s==0 )
+	    	byteS[1] |= 0x40;	// payloadStart
+	    fread( &byteS[head], 1, readSize, infile );
+#if 0
+	    if( (s==0) || (readSize<184) )
+	    {
+		for( i=0; i<readSize; i++ )
+		{
+		    fprintf( stdout, "%02X ", packet[4+i] );
+		    if( (i%16)==15 )
+		    	fprintf( stdout, "\n" );
+		}
+		fprintf( stdout, "\n" );
+	    }
+#endif	    
+	    written = fwrite( packet, 1, 192,  outfile );
+	    if( written<188 )
+	    {
+	    	fprintf( stdout, "written=%d\n", written );
+		exit( 1 );
+	    }
+	    (*nPacket)++;
+	}
+//	fprintf( stdout, "nPCR=%8X\n", nPCR );
+//	fprintf( stdout, "Pes2Tts() done\n" );
+	return nPCR/300;
+}
+
+int ParsePes( char *filename, int *Table )
+{
+int readed;
+unsigned char buffer[1024];
+unsigned char header[1024];
+int head_addr=0;
+int l_head_addr=(-1);
+int nZero=0;
+int total=0;
+int state=0;
+int header_pos=0;
+int nPes=0;
+int i;
+int pes_len=(-1);
+int pes_pos=(-1);
+
+	g_addr = 0;
+	FILE *infile = fopen( filename, "rb" );
+	if( infile==NULL )
+	{
+	    fprintf( stdout, "Can't open [%s]\n", filename );
+	    exit( 1 );
+	}
+	while( 1 )
+	{
+	    readed = gread( buffer, 1, 1024, infile );
+	    if( readed<1 )
+	    {
+//	    	fprintf( stdout, "EOF(0x%X)\n", total );
+		break;
+	    }
+#if 0
+	    if( bDisplay==0 )
+	    {
+	    	if( (g_addr-readed)%0x100000==0 )
+		    fprintf( stdout, "%8llX\n", g_addr-readed );
+	    }
+#endif
+	    total+=readed;
+	    for( i=0; i<readed; i++ )
+	    {
+	    	switch( state )
+		{
+		case 0 :
+		    nZero=0;
+		    if( buffer[i]==0x00 )
+		    {
+		    	state++;
+			nZero++;
+		    } else {
+		    }
+		    break;
+		case 1 :	// 00
+		    if( buffer[i]==0x00 )
+		    {	// 00 00
+		    	state++;
+			nZero++;
+		    } else {	// 00 XX
+			state=0;
+		    }
+		    break;
+		case 2 :	// 00 00
+		    if( buffer[i]==0x01 )
+		    {	// 00 00 .. 01
+		    	state++;
+		    } else if( buffer[i]==0x00 )
+		    {	// 00 00 00
+			nZero++;
+		    } else {	// 00 00 .. XX
+			state=0;
+		    }
+		    break;
+		case 3 :	// 00 00 01
+#if 0
+		    if( (buffer[i]==0xC0)
+		     || (buffer[i]>=0xE0) )
+#else
+		    if( (buffer[i]>=0xC0)
+		     || (buffer[i]==0xBD) )
+#endif
+		    {
+			memset( header, 0, 1024 );
+			head_addr = g_addr-readed+i-3;
+			header[0] = 0;
+			header[1] = 0;
+			header[2] = 1;
+			header[3] = buffer[i];
+			header_pos=4;
+//			fprintf( stdout, "00 00 01 %02X\n", buffer[i] );
+		    	state++;
+			pes_len = (-1);
+			pes_pos = 0;
+		    } else {
+			state=0;
+		    }
+		    break;
+		// -----------------------
+		case 4 :	// 00 00 01 EX
+		    pes_pos++;
+		    if( header_pos<1024 )
+		    {
+			header[header_pos++] = buffer[i];
+		    }
+		    if( header_pos>=9 )
+		    {
+			int len = header[8];
+			pes_len = (header[4]<<8)
+			        | (header[5]<<0);
+			if( header_pos>(len+8) )
+			{
+			    state = 5;
+			    unsigned int PTSH, PTSL, DTSH, DTSL;
+			    unsigned int PTS=0xFFFFFFFF;
+			    unsigned int DTS=0xFFFFFFFF;
+			    PTSL=0xFFFFFFFF;
+			    {
+			    	int offset;
+				int pes_len = parsePES_header(
+				    &header[4], 0,
+				    &PTSH, &PTSL, &DTSH, &DTSL, &offset );
+				if( PTSL!=0xFFFFFFFF )
+				{
+				    PTS=PTSL;
+				    DTS=DTSL;
+				    if( DTS==0xFFFFFFFF )
+					DTS=PTS;
+				    int dh, dm, ds, dms;
+				    int ph, pm, ps, pms;
+				    TcTime32( 0, DTS, &dh, &dm, &ds, &dms );
+				    TcTime32( 0, PTS, &ph, &pm, &ps, &pms );
+				    if( bDisplay )
+				    fprintf( stdout, 
+		"addr=%8X : DTS=%2d:%02d:%02d.%03d PTS=%2d:%02d:%02d.%03d",
+		    head_addr, dh, dm, ds, dms, ph, pm, ps, pms );
+				} else {
+				    if( bDisplay )
+				    fprintf( stdout, 
+		"addr=%8X : DTS=--:--:--.--- PTS=--:--:--.---",
+					head_addr );
+				}
+				if( bDisplay )
+				{
+				    fprintf( stdout, " : "  );
+				    if( l_head_addr<0 )
+				    {
+					fprintf( stdout, "L=%6d,   -  :", 
+					    pes_len );
+				    } else {
+					fprintf( stdout, "L=%6d,%6d:" ,
+					    pes_len, head_addr-l_head_addr );
+				    }
+				    fprintf( stdout, "\n" );
+				}
+				Table[nPes*TABLE_UNIT+0] = DTS;
+				Table[nPes*TABLE_UNIT+1] = PTS;
+				Table[nPes*TABLE_UNIT+2] = head_addr;
+				if( l_head_addr>=0 )
+				    Table[(nPes-1)*TABLE_UNIT+3] 
+				    	= head_addr-l_head_addr;
+				nPes++;
+			    }
+			    l_head_addr = head_addr;
+			// -------------------------------
+			}
+		    }
+		    break;
+		case 5 :
+		    if( pes_len>pes_pos )
+		    {
+		    	pes_pos++;
+		    } else {
+		    	state = 0;
+		    }
+		    break;
+		}
+	    }
+	}
+	if( nPes>0 )
+	    Table[(nPes-1)*TABLE_UNIT+3] = g_addr-l_head_addr;
+	fprintf( stdout, "nPes=%d\n", nPes );
+
+	fclose( infile );
+
+	return nPes;
+}
+
+// ------------------------------------------------------
+
+void pes2tts_Usage( char *prg )
+{
+	fprintf( stdout, "%s filename [-Ooutname]\n", prg );
+	exit( 1 );
+}
+
+int pes2tts( int argc, char *argv[] )
+{
+int i, j;
+int args=0;
+int nFiles=0;
+#define MAX_FILE 256
+char *filename[MAX_FILE];
+char outFilename[1024];
+
+FILE *infile=NULL;
+FILE *outfile=NULL;
+FILE *infileA=NULL;
+
+int *Table[MAX_FILE];
+int rateKB=0;
+int offset=0;
+	sprintf( outFilename, "out.mts" );
+
+	for( i=0; i<MAX_FILE; i++ )
+	{
+	    filename[i] = NULL;
+	}
+	for( i=1; i<argc; i++ )
+	{
+	    if( argv[i][0]=='-' )
+	    {
+		switch( argv[i][1] )
+		{
+		case 'R' :
+		    rateKB = atoi( &argv[i][2] );
+		    break;
+		case 'D' :
+		    bDebug = 1;
+		    break;
+		case 'O' :
+		    sprintf( outFilename, "%s", &argv[i][2] );
+		    break;
+		default :
+		    pes2tts_Usage( argv[0] );
+		    break;
+		}
+	    } else if( argv[i][0]=='+' )
+	    {
+		switch( argv[i][1] )
+		{
+		case 'D' :
+		    bDisplay=1;
+		    break;
+		case 'O' :
+		    offset = atoi( &argv[i][2] );
+		    break;
+		default :
+		    pes2tts_Usage( argv[0] );
+		    break;
+		}
+	    } else if( argv[i][0]=='=' )
+	    {
+		switch( argv[i][1] )
+		{
+		case 'A' :
+		    AudioCodec=atoi( &argv[i][2] );
+		    break;
+		default :
+		    pes2tts_Usage( argv[0] );
+		    break;
+		}
+	    } else {
+		switch( args )
+		{
+		case 0 :
+		case 1 :
+		case 2 :
+		case 3 :
+		case 4 :
+		case 5 :
+		case 6 :
+		case 7 :
+		    filename[nFiles++] = argv[i];
+		    break;
+		default :
+		    pes2tts_Usage( argv[0] );
+		    break;
+		}
+		args++;
+	    }
+	}
+	if( filename[0]==NULL )
+	{
+	    pes2tts_Usage( argv[0] );
+	}
+	// -------------------------------------------
+	// initialize Table
+	int n;
+	for( n=0; n<nFiles; n++ )
+	{
+	    Table[n] = (int *)malloc( 4*TABLE_UNIT*1024*1024 );
+	    if( Table[n]==NULL )
+	    {
+		fprintf( stdout, "Can't alloc Table[%d]\n", n );
+		exit( 1 );
+	    }
+	    for( i=0; i<(1024*1024); i++ )
+	    {
+		for( j=0; j<TABLE_UNIT; j++ )
+		{
+		    Table[n][i*TABLE_UNIT+j] = 0;
+		}
+	    }
+	}
+	// -------------------------------------------
+	// Parse PES 
+	int nPes[MAX_FILE];
+	for( n=0; n<nFiles; n++ )
+	{
+	    nPes[n] = ParsePes( filename[n], Table[n] );
+	    fprintf( stdout, "%s : %d pes\n", filename[n], nPes[n] );
+	}
+
+	// -------------------------------------------
+	// Analyze bitrate
+#define MAX_RT 601
+	unsigned int minRT[MAX_RT];
+	unsigned int maxRT[MAX_RT];
+	unsigned int delta[MAX_RT];
+	int sp=0;
+	static int spn[] = { 15, 30, 59, 60, 120, 300, 600, -1 };
+	for( n=0; n<MAX_RT; n++ )
+	{
+	    minRT[n] = 0x7FFFFFFF;
+	    maxRT[n] = 0;
+	    delta[n] = 0;
+	}
+	for( n=0; n<nPes[0]; n++ )
+	{
+	    int sz;
+	    if( bDisplay )
+	    fprintf( stdout, "%5d : %8X %8X %8X %8X\n",
+		n, Table[0][n*TABLE_UNIT+0], Table[0][n*TABLE_UNIT+1], 
+		Table[0][n*TABLE_UNIT+2], Table[0][n*TABLE_UNIT+3] );
+	    for( sp=0; spn[sp]>0; sp++ )
+	    {
+#if 0
+		fprintf( stdout, "sp=%2d : spn[sp]=%4d\n",
+			sp, spn[sp] );
+#endif
+		if( (n+spn[sp])<nPes[0] )
+		{
+		    delta[spn[sp]] = Table[0][(n+spn[sp])*TABLE_UNIT+0]
+				    -Table[0][(n        )*TABLE_UNIT+0];
+		    sz = Table[0][(n+spn[sp])*TABLE_UNIT+2]
+		       -Table[0][n*TABLE_UNIT+2];
+		    if( sz<minRT[spn[sp]] )
+			minRT[spn[sp]] = sz;
+		    if( sz>maxRT[spn[sp]] )
+			maxRT[spn[sp]] = sz;
+		}
+	    }
+	}
+	fprintf( stdout, "delta[spn[sp]] calculated\n" );
+	fflush( stdout );
+	for( sp=0; spn[sp]>0; sp++ )
+	{
+	    fprintf( stdout, "%3d : delta=%8d, min=%8d, max=%8d ",
+	    	spn[sp],
+	    	delta[spn[sp]],
+	    	minRT[spn[sp]],
+	    	maxRT[spn[sp]] );
+	    fflush( stdout );
+	    if( delta[spn[sp]]>0 )
+		fprintf( stdout, ": %5d KB/s\n",
+		    maxRT[spn[sp]]/1024*90000/delta[spn[sp]] );
+	    else
+	    	fprintf( stdout, "\n" );
+	}
+	// -------------------------------------------
+	// Calcurate PCR
+	// insert PCR packet every 100ms
+	// audio may be 300Kbps
+	// may have space every 4ms
+	int rate = maxRT[spn[0]]/1024*90000/delta[spn[0]];
+	fprintf( stdout, "rate@spn[0]=%d\n", rate );
+#if 0
+	rate = (rate/100+1)*100;
+#else
+//	rate = (rate/100+3)*100;
+	rate = (rate/100+10)*100;
+#endif
+	int rateOK=0;
+	for( ; ; )
+	{
+	    fprintf( stdout, "rate=%4d\n", rate );
+	    int BAD=0;
+	    for( n=nPes[0]-1; n>=0; n-- )
+	    {
+	    	int DTS;
+		unsigned int PTS, sz;
+		int packet;
+		DTS = Table[0][n*TABLE_UNIT+0];
+		PTS = Table[0][n*TABLE_UNIT+1];
+		sz  = Table[0][n*TABLE_UNIT+3];
+		int packUnit=(188-4);
+		packet = (sz+packUnit-1)/packUnit;
+		int ms = packet*188/rate;
+		int space = (ms+3)/4;	// for PCR and audio : every 4ms
+		Table[0][n*TABLE_UNIT+6] = space;
+		packet += space;
+		int next=n+1;
+#if 1
+		if( next<(nPes[0]-1) )
+		{
+		    if( DTS>Table[0][next*TABLE_UNIT+4] )
+		    {
+		    	DTS = Table[0][next*TABLE_UNIT+4]
+			    - 1*188*90/rate;
+//			fprintf( stdout, "Update DTS=%d\n", DTS );
+			if( DTS<0 )
+			{
+			    fprintf( stdout, "DTS[%d]=%d\n", n, DTS );
+			    BAD++;
+			    break;
+			}
+		    }
+		}
+#endif
+		Table[0][n*TABLE_UNIT+5] = DTS;
+		Table[0][n*TABLE_UNIT+4] = DTS-packet*188*90/rate;
+	    }
+// Table[0]=DTS
+// Table[1]=PTS
+// Table[2]=head_addr
+// Table[3]=head_addr-l_head_addr
+// Table[4]=DTS'-packet*188*90/rate
+// Table[5]=DTS'
+// Table[6]=space
+	    if( BAD )
+	    	break;
+	    int maxDiff=0;
+	    int nfile=0;
+	    for( n=0; n<nPes[nfile]; n++ )
+	    {
+		int diff = Table[nfile][n*TABLE_UNIT+0]
+			  -Table[nfile][n*TABLE_UNIT+5] ;
+#if 0
+		DumpTable( Table, nfile, n, diff );
+#endif
+		if( diff>maxDiff )
+		{
+		    if( diff>180000 )
+		    {
+			DumpTable( Table, nfile, n+0, diff );
+			DumpTable( Table, nfile, n+1, 0 );
+		    }
+		    fprintf( stdout, "n=%d : maxDiff(%d->%d)\n", 
+			n, maxDiff, diff );
+		    maxDiff = diff;
+		}
+	    }
+	    fprintf( stdout, "maxDiff=%d\n", maxDiff );
+	    if( maxDiff< 45000 )
+		rateOK = rate;
+	    if( maxDiff>180000 )	// 2sec
+		break;
+	    int rateD = (rate/100-1);
+	    rate = rateD*100;
+	}
+	if( rateKB==0 )
+	    rateKB = rateOK;
+	fprintf( stdout, "rateKB=%d\n", rateKB );
+	fflush( stdout );
+	if( rateKB>0 )
+	{
+	    // Calculate PCR
+	    int f;
+	    for( f=0; f<nFiles; f++ )
+	    {
+		for( n=nPes[f]-1; n>=0; n-- )
+		{
+		    unsigned int DTS, PTS, sz;
+		    int packet;
+		    DTS = Table[f][n*TABLE_UNIT+0];
+		    PTS = Table[f][n*TABLE_UNIT+1];
+		    sz  = Table[f][n*TABLE_UNIT+3];
+		    int packUnit=(188-4);
+		    packet = (sz+packUnit-1)/packUnit;
+		    int ms = packet*188/rateKB;
+		    int space = (ms+3)/4;	// for PCR and audio : every 4ms
+		    Table[f][n*TABLE_UNIT+6] = space;
+		    packet += space;
+		    if( n<(nPes[f]-1) )
+		    {
+			if( DTS>Table[f][(n+1)*TABLE_UNIT+4] )
+			{
+			    DTS = Table[f][(n+1)*TABLE_UNIT+4]
+				- 1*188*90/rateKB;
+			}
+		    }
+		    Table[f][n*TABLE_UNIT+5] = DTS;
+		    Table[f][n*TABLE_UNIT+4] = DTS-packet*188*90/rateKB;// PCR
+		}
+	    }
+	    int maxDiff=0;
+	    for( f=0; f<nFiles; f++ )
+	    {
+	    	fprintf( stdout, "file=%s, nPES=%d\n", filename[f], nPes[f] );
+		fprintf( stdout, 
+		    " nPES :    DTS      PTS       addr      sz  :  PCR\n" );
+		for( n=0; n<nPes[f]; n++ )
+		{
+		    int diff = Table[f][n*TABLE_UNIT+0]+offset
+			      -Table[f][n*TABLE_UNIT+5] ;
+		    DumpTable( Table, f, n, diff );
+		    if( diff>maxDiff )
+			maxDiff = diff;
+		}
+	    }
+	    infile = fopen( filename[0], "rb" );
+	    if( infile==NULL )
+	    {
+	    	fprintf( stdout, "Can't open %s\n", filename[0] );
+		exit( 1 );
+	    }
+	    if( nFiles>1 )
+	    {
+		infileA = fopen( filename[1], "rb" );
+		if( infileA==NULL )
+		{
+		    fprintf( stdout, "Can't open %s\n", filename[1] );
+		    exit( 1 );
+		}
+	    }
+	    outfile = fopen( outFilename, "wb" );
+	    if( outfile==NULL )
+	    {
+	    	fprintf( stdout, "Can't open %s\n", outFilename );
+		exit( 1 );
+	    }
+	    int nPacket[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+	    int bPCR=1;
+	    int bPAT=1;
+	    int nA=0;
+	    int next=0;
+	    for( n=0; n<nPes[0]; n++ )
+	    {
+	    	long long PCR;
+		unsigned int DTS, PTS, off, sz;
+		DTS = Table[0][n*TABLE_UNIT+0];
+		PTS = Table[0][n*TABLE_UNIT+1];
+		off = Table[0][n*TABLE_UNIT+2];
+		sz  = Table[0][n*TABLE_UNIT+3];
+		PCR = Table[0][n*TABLE_UNIT+4]-offset;
+		if( nFiles>1 )
+		{
+		    while( nA<nPes[1] )
+		    {
+			int DTS_A = Table[1][nA*TABLE_UNIT+0];
+			int offA  = Table[1][nA*TABLE_UNIT+2];
+			int szA   = Table[1][nA*TABLE_UNIT+3];
+			int PCR_A = Table[1][nA*TABLE_UNIT+4]-offset;
+			if( PCR_A<PCR )
+			{
+			    int nextPCR = PCR_A;
+			    if( PCR_A<next )
+			    {
+			    	nextPCR=next;
+		    fprintf( stdout, "PCR rewind(%8X->%8X)\n", next, PCR_A );
+			    }
+			    if( bDebug )
+			    fprintf( stdout, 
+			    	"%16llX : Audio%5d(%8X,%8X)\n", 
+//				PCR, nA, PCR_A, DTS_A );
+				nextPCR, nA, PCR_A, DTS_A );
+			    next=Pes2Tts( infileA, offA, szA, nextPCR,
+				    &nPacket[1], 
+				    outfile, 0x201, rateKB, 0, 0 );
+			    nA++;
+			} else {
+			    break;
+			}
+		    }
+		}
+		int nextPCR = PCR;
+		if( PCR<next )
+		{
+		    nextPCR = next;
+		    fprintf( stdout, "PCR rewind(%8X->%8X)\n", next, PCR );
+		}
+		if( bDebug )
+		fprintf( stdout, 
+		    "%16llX : Video%5d(%8llX,%8X)\n", 
+//		    	PCR, n, PCR, DTS );
+		    	nextPCR, n, PCR, DTS );
+		next=Pes2Tts( infile, off, sz, nextPCR, &nPacket[0], 
+			outfile, 0x200, rateKB, bPCR, bPAT );
+		bPAT=0;
+	    }
+	} else {
+	    fprintf( stdout, "Invalid rateKB(%d)\n", rateKB );
+	}
+	if( infileA )
+	    fclose( infileA );
+	if( outfile )
+	    fclose( outfile );
+	fclose( infile );
+	fprintf( stdout, "%s generated\n", outFilename );
+	return 0;
+}
+
+#ifndef MAIN
+int bDebug=0;
+int main( int argc, char *argv[] )
+{
+	return pes2tts( argc, argv );
+}
+#endif
+

@@ -1,0 +1,719 @@
+
+/*
+	tsLib.cpp
+		2011.10.31 by T.Oda
+
+		2012.9.6 SrcAddr() add type parameter
+		2012.9.7 PES_header
+*/
+
+#include <stdio.h>
+#include <string.h>	// strlen
+#include <stdlib.h>	// free
+
+#include "tsLib.h"
+#include "parseLib.h"
+
+typedef unsigned int UINT;
+
+int bDebugPES=0;
+int bDebugUpdate=0;
+int bDebugUpdateTS=0;
+
+int g_DTSL = (-1);
+int g_DTSH = (-1);
+int g_PTSL = (-1);
+int g_PTSH = (-1);
+
+int PtsOffset=INVALID_OFFSET;
+int DtsOffset=INVALID_OFFSET;
+int fromPts=INVALID_OFFSET;
+int toPts=INVALID_OFFSET;
+int fromDts=INVALID_OFFSET;
+int toDts=INVALID_OFFSET;
+
+#if 0
+unsigned int g_update_addr[MAX_UPDATE];
+unsigned int g_update_bits[MAX_UPDATE];
+unsigned int g_update_size[MAX_UPDATE];
+unsigned int g_update_data[MAX_UPDATE];
+#else
+unsigned int *g_update_addr = NULL;
+unsigned int *g_update_bits = NULL;
+unsigned int *g_update_size = NULL;
+unsigned int *g_update_data = NULL;
+#endif
+int g_update_count=0;
+
+#if 0
+long long TsAddr [ADDR_MAX];
+long long PesAddr[ADDR_MAX];
+#else
+unsigned long long *TsAddr0=NULL;
+unsigned long long *TsAddr =NULL;
+unsigned long long *PesAddr=NULL;
+#endif
+
+// ----------------------------------------------------
+
+int TS( unsigned int  High, unsigned int Low, 
+	unsigned int *pTSH, unsigned int *pTSL )
+{
+unsigned long TS32_30, TS29_15, TS14_00;
+unsigned long TS32, TS31_00;
+	TS32_30 = (High>>1) & 0x0007;
+	TS29_15 = (Low>>17) & 0x7FFF;
+	TS14_00 = (Low>> 1) & 0x7FFF;
+	TS32 = TS32_30>>2;
+	TS31_00 = (TS32_30<<30) | (TS29_15<<15) | (TS14_00);
+	*pTSH = TS32;
+	*pTSL = TS31_00;
+	return TS31_00;
+}
+
+int initTsAddr( )
+{
+	if( TsAddr )
+	    free( TsAddr );
+	if( TsAddr0 )
+	    free( TsAddr0 );
+	if( PesAddr )
+	    free( PesAddr );
+	TsAddr0 = (unsigned long long *)calloc( 8, ADDR_MAX );
+	if( TsAddr0==NULL )
+	{
+	    fprintf( stdout, "Can't alloc TsAddr0\n" );
+	    exit( 1 );
+	}
+	TsAddr = (unsigned long long *)calloc( 8, ADDR_MAX );
+	if( TsAddr==NULL )
+	{
+	    fprintf( stdout, "Can't alloc TsAddr\n" );
+	    exit( 1 );
+	}
+	PesAddr = (unsigned long long *)calloc( 8, ADDR_MAX );
+	if( PesAddr==NULL )
+	{
+	    fprintf( stdout, "Can't alloc PesAddr\n" );
+	    exit( 1 );
+	}
+	memset( PesAddr, 0xFF, 8*ADDR_MAX );
+	return 0;
+}
+
+static int L_index=0;
+static int L_addr=0;
+
+long long SrcAddr( int addr, int type )
+{
+int i;
+long long PesAddr0 = 0 ;
+long long tsAddr0 = 0;
+long long tsAddrX = 0;
+//	fprintf( stdout, "SrcAddr(%X)\n", addr );
+	if( PesAddr==NULL )
+	{
+	    fprintf( stdout, "PesAddr=NULL\n" );
+	    return 0xFFFFFFFF;
+	}
+	long long pesAddr = PesAddr[0];
+	if( pesAddr==0xFFFFFFFF )
+	    return 0xFFFFFFFF;
+	int i_start=0;
+	if( addr>L_addr )
+	{
+	    i_start = L_index;
+	}
+	L_addr = addr;
+	for( i=i_start; i<ADDR_MAX; i++ )
+	{
+	    pesAddr =PesAddr[i];
+	    long long tsAddr  =TsAddr [i];
+	    long long tsAddr00=TsAddr0[i];
+	    L_index = i;
+	    if( pesAddr==0xFFFFFFFF )
+	    {
+	    	if( type==0 )
+		    return tsAddrX + (addr-PesAddr0);
+		else
+		    return tsAddr0;
+	    }
+//	    fprintf( stdout, "%4d:%8X:%8X,%8X\n", i, addr, pesAddr, tsAddr  );
+	    if( addr<pesAddr )
+	    {
+	    	if( type==0 )
+		    return tsAddrX + (addr-PesAddr0);
+		else
+		    return tsAddr0;
+	    }
+	    PesAddr0 = pesAddr;
+	    tsAddrX  = tsAddr ;
+	    tsAddr0  = tsAddr00;
+#if 0
+	    fprintf( stdout, "PesAddr0=%X, tsAddrX=%X, tsAddr0=%X\n",
+	    	pesAddr, tsAddr, tsAddr00 );
+#endif
+	}
+	return 0xFFFFFFFF;
+}
+
+static char AddrStrData[80];
+
+char *AddrStr( unsigned int addr )
+{
+unsigned int SrcA = SrcAddr(addr,0);
+
+    if( SrcA==0xFFFFFFFF )
+	sprintf( AddrStrData, "0x%X", addr );
+    else
+	sprintf( AddrStrData, "0x%X,0x%X", addr, SrcA );
+    return AddrStrData;
+}
+
+char *AddrStr2( unsigned int addr )
+{
+unsigned int SrcA = SrcAddr(addr,0);
+unsigned int SrcB = SrcAddr(addr,1);
+
+    if( SrcA==0xFFFFFFFF )
+	sprintf( AddrStrData, "0x%X", addr );
+    else
+	sprintf( AddrStrData, "0x%X,0x%X:0x%X", addr, SrcA, SrcB );
+    return AddrStrData;
+}
+
+
+static char TsStrData[80];
+char *TsStr( )
+{
+      sprintf( TsStrData, "PTS=%8X,DTS=%8X", g_PTSL, g_DTSL );
+      return TsStrData;
+}
+
+static char DtsTimeData[80];
+char *DtsTimeStr( )
+{
+	if( g_DTSH==0xFFFFFFFF )
+	{
+	    sprintf( DtsTimeData, "---:--:--.---" );
+	} else {
+	    int hour, min, sec, msec;
+	    TcTime32( g_DTSH, g_DTSL, &hour, &min, &sec, &msec );
+	    sprintf( DtsTimeData, "%3d:%02d:%02d.%03d", hour, min, sec, msec );
+	}
+	return DtsTimeData;
+}
+
+void CannotRead( char *str )
+{
+	if( str!=NULL )
+	    fprintf( stdout, "Can't read %s@(%s)\n", str, AddrStr(g_addr) );
+	else
+	    fprintf( stdout, "Can't read @(%s)\n", AddrStr(g_addr) );
+}
+
+int  ReadAddrFile( char filename[], 
+	char srcFilename[],
+	unsigned long long TsAddr[], 
+	unsigned long long PesAddr[],
+	int *nAddr, int MaxAddr )
+{
+int i;
+char TsBuffer[1024];
+int nTS = *nAddr;
+	srcFilename[0] = 0;
+	if( TsAddr==NULL )
+	{
+	    fprintf( stdout, "TsAddr=NULL\n" );
+	    exit( 1 );
+	}
+	fprintf( stdout, "Read %s (%d)\n", filename, nTS );
+	fflush( stdout );
+	FILE *addr_fp = fopen( filename, "r" );
+	if( addr_fp==NULL )
+	{
+	    fprintf( stdout, "Can't open %s\n", filename );
+	    return -1;
+	}
+	if( fgets( srcFilename, 1023, addr_fp )==NULL )
+	{
+	    fprintf( stdout, "Can't get srcFilename\n" );
+	    return -1;
+	}
+	for( i=0; i<strlen(srcFilename); i++ )
+	{
+	    if( srcFilename[i]=='\n' )
+		srcFilename[i] = 0;
+	    if( srcFilename[i]=='\r' )
+		srcFilename[i] = 0;
+	}
+	fprintf( stdout, "srcFilename = %s\n", srcFilename );
+	fflush( stdout );
+//	fprintf( stdout, "TsAddr=%llX, PesAddr=%llX\n", TsAddr, PesAddr );
+	while( 1 )
+	{
+	    if( fgets( TsBuffer, 1024, addr_fp )==NULL )
+	    {
+	    	fprintf( stdout, "EOF\n" );
+		break;
+	    }
+#if 0
+	    fprintf( stdout, "%s", TsBuffer );
+	    fflush( stdout );
+#endif
+	    int ts_addr_top;
+	    int ts_addr, pes_addr, size, pcrH, pcrL;
+	    unsigned long long PCR;
+//	    if( TsBuffer[0]!=' ' )
+	    int len = strlen( TsBuffer );
+	    // len = 75
+/*
+	    fprintf( stdout, "len==%d\n", len );
+	    fprintf( stdout, "TsBuffer[11]=%02X\n", TsBuffer[11] );
+	    fprintf( stdout, "TsBuffer[12]=%02X\n", TsBuffer[12] );
+*/
+	    if( (TsBuffer[10]!=',')
+	     || (TsBuffer[11]!=' ')
+	     || (len<70)
+	    ) {
+	    	fprintf( stdout, "Invalid AddrFile(%s)\n", filename );
+		fprintf( stdout, "TsBuffer=%s", TsBuffer );
+		return -1;
+	    }
+	    sscanf( TsBuffer, "%X, %X, %X, %X, %X %X %llX",
+	    	&ts_addr_top, &ts_addr, &pes_addr, &size, &pcrH, &pcrL, &PCR );
+	    if(PesAddr==NULL )
+	    {
+		TsAddr [nTS] = ts_addr_top;
+		TsAddr0[nTS] = ts_addr_top;
+	    } else {
+		TsAddr0[nTS] = ts_addr_top;
+		TsAddr [nTS] = ts_addr;
+		PesAddr[nTS] = pes_addr;
+	    }
+#if 0
+	    fprintf( stdout, "%8llX,%8llX,%8llX\n", 
+	    	TsAddr0[nTS],
+	    	TsAddr [nTS],
+	    	PesAddr[nTS] );
+#endif
+	    nTS++;
+	    if( nTS>=MaxAddr )
+	    {
+	    	fprintf( stdout, "Too many TS (%d)\n", nTS );
+		return -1;
+	    }
+#if 1
+	    TsAddr [nTS] = 0xFFFFFFFF;
+	    TsAddr0[nTS] = 0xFFFFFFFF;
+	    if( PesAddr!=NULL )
+		PesAddr[nTS] = 0xFFFFFFFF;
+#endif
+	}
+	fclose( addr_fp );
+	fprintf( stdout, "Read done\n" );
+	fflush( stdout );
+	*nAddr = nTS;
+	return 0;
+}
+
+#if 0
+int TcTime24( unsigned int vCountH, unsigned int vCountL,
+	int *hour, int *min, int *sec, int *msec )
+{
+int Error=0;
+unsigned long long llCount;
+	llCount = vCountH & 0x3FFFFFFF;
+	llCount = (llCount<<24) | vCountL;
+	*msec = llCount/90;
+	*sec  = *msec/1000;
+	*min  = (*sec/60)%60;
+	*hour = (*sec/60/60);
+
+	*msec = *msec % 1000;
+	*sec  = *sec  %   60;
+	return Error;
+}
+
+int TcTime32( unsigned int vCountH, unsigned int vCountL,
+	int *hour, int *min, int *sec, int *msec )
+{
+int Error=0;
+unsigned long long llCount;
+	llCount = vCountH & 0x3FFFFFFF;
+	llCount = (llCount<<32) | vCountL;
+	*msec = llCount/90;
+	*sec  = *msec/1000;
+	*min  = (*sec/60)%60;
+	*hour = (*sec/60/60);
+
+	*msec = *msec % 1000;
+	*sec  = *sec  %   60;
+	return Error;
+}
+#else
+int TcTime24( unsigned int vCountH, unsigned int vCountL,
+	int *hour, int *min, int *sec, int *msec )
+{
+int Error=0;
+unsigned long long llCount;
+	llCount = vCountH & 0x3FFFFFFF;
+	llCount = (llCount<<24) | vCountL;
+	*msec = llCount/90;
+	*sec  = *msec/1000;
+	*min  = (*sec/60)%60;
+	*hour = (*sec/60/60);
+
+	*msec = *msec % 1000;
+	*sec  = *sec  %   60;
+	if( *hour<0 )
+	{
+	    fprintf( stdout, "TcTime24(%8X,%8X) %9LX : %3d:%02d:%02d",
+		    vCountH, vCountL, llCount, *hour, *min, *sec );
+	    *hour = 99;
+	    *min  = 99;
+	    *sec  = 99;
+	    *msec = 999;
+	    Error=1;
+	}
+	return Error;
+}
+int TcTime32( unsigned int vCountH, unsigned int vCountL,
+	int *hour, int *min, int *sec, int *msec )
+{
+int Error=0;
+unsigned long long llCount;
+	llCount = vCountH & 0x3FFFFFFF;
+	llCount = (llCount<<32) | vCountL;
+	*msec = llCount/90;
+	*sec  = *msec/1000;
+	*min  = (*sec/60)%60;
+	*hour = (*sec/60/60);
+
+	*msec = *msec % 1000;
+	*sec  = *sec  %   60;
+	return Error;
+}
+#endif
+
+int DoUpdate( int addr, int bitOffset, int size, int value )
+{
+#if 0
+	fprintf( stdout, "DoUpdate(0x%X,%d,%d,%d)\n",
+		addr, bitOffset, size, value );
+#endif
+	if( g_update_addr==NULL )
+	{
+	    fprintf( stdout, "g_update_addr==NULL\n" );
+	    EXIT();
+	}
+	if( g_update_count>=MAX_UPDATE )
+	{
+	    fprintf( stdout, "g_update_count is too large (%d>%d)\n",
+		    g_update_count, MAX_UPDATE );
+	    EXIT();
+	}
+	g_update_addr[g_update_count] = addr;
+	g_update_bits[g_update_count] = bitOffset;
+	g_update_size[g_update_count] = size;
+	g_update_data[g_update_count] = value;
+	if( bDebugUpdate )
+	{
+	    fprintf( stdout, "update Addr=%X(%X),bit=%2d,size=%2d,0x%02X\n",
+		(UINT)g_update_addr[g_update_count],
+		(UINT)SrcAddr(g_update_addr[g_update_count],0),
+		(int )g_update_bits[g_update_count],
+		(int )g_update_size[g_update_count],
+		(UINT)g_update_data[g_update_count] );
+	}
+	g_update_count++;
+	return 0;
+}
+
+int ShowUpdate( )
+{
+    if( g_update_addr==NULL )
+    {
+	fprintf( stdout, "g_update_addr==NULL\n" );
+	EXIT();
+    }
+    if( g_update_addr[0]==0xFFFFFFFF )
+    {
+	fprintf( stdout, "No g_update\n" );
+	return 0;
+    } else {
+	fprintf( stdout, "addr=%X\n", g_update_addr[0] );
+	fprintf( stdout, "bits=%X\n", g_update_bits[0] );
+	fprintf( stdout, "size=%X\n", g_update_size[0] );
+	fprintf( stdout, "data=%X\n", g_update_data[0] );
+	return 1;
+    }
+}
+
+int UpdateTS( int stAddr, unsigned int TSH, unsigned int TSL, 
+	int modeTS, int bPTS, int bDTS, int TSoffset )
+{
+int code=0;
+int nTS[5];
+	if( modeTS==0 )
+	    fprintf( stdout, "UpdatePTS(%02X:%08X,%d)\n", TSH, TSL, TSoffset );
+	else
+	    fprintf( stdout, "UpdateDTS(%02X:%08X,%d)\n", TSH, TSL, TSoffset );
+	long long TSLL = (((long long)TSH)<<32)
+		       | (((long long)TSL)<< 0);
+	long long nTSLL = TSLL + TSoffset;
+	if( bDebugUpdateTS )
+	    fprintf( stdout, "TSLL=%08X,%08X -> %08X,%08X\n", 
+		(int)( TSLL>>32), (int) TSLL,
+		(int)(nTSLL>>32), (int)nTSLL );
+	TSLL = nTSLL;
+	switch( modeTS )
+	{
+	case MODE_PTS :
+	    if( bDTS==0 )
+	    	code = 2;
+	    else
+	    	code = 3;
+	    break;
+	case MODE_DTS :
+	    if( bPTS==0 )
+		code = 0;
+	    else
+		code = 1;
+	    break;
+	default :
+	    fprintf( stdout, "Illegal\n" );
+	    EXIT();
+	}
+	// 4,3,1
+	nTS[0] = (code<<4) | (((TSLL>>30) & 7)<<1) | 1;
+	nTS[1] =  ((TSLL>>22) & 0xFF);
+	nTS[2] = (((TSLL>>15) & 0xFF)<<1) | 1;
+	nTS[3] =  ((TSLL>> 7) & 0xFF);
+	nTS[4] = (((TSLL>> 0) & 0xFF)<<1) | 1;
+	DoUpdate( stAddr, 0, 8, nTS[0] );
+	DoUpdate( stAddr, 8, 8, nTS[1] );
+	DoUpdate( stAddr,16, 8, nTS[2] );
+	DoUpdate( stAddr,24, 8, nTS[3] );
+	DoUpdate( stAddr,32, 8, nTS[4] );
+	int TS_H = (nTS[0]<< 0);
+	int TS_L = (nTS[1]<<24)
+		 | (nTS[2]<<16)
+		 | (nTS[3]<< 8)
+		 | (nTS[4]<< 0);
+	unsigned int nTSH, nTSL;
+	TS( TS_H, TS_L, &nTSH, &nTSL );
+	if( bDebugUpdateTS )
+	{
+	    fprintf( stdout, "%02X,%08X\n", TS_H, TS_L );
+	    fprintf( stdout, "new TS=%02X:%08X\n", nTSH, nTSL );
+	}
+	return 0;
+}
+
+int PES_header( FILE *fp, unsigned char buffer[], int bDisplay,
+	unsigned int *pPTSH, unsigned int *pPTSL, 
+	unsigned int *pDTSH, unsigned int *pDTSL )
+{
+int len;
+int readed;
+int offset=0;
+	*pPTSH=0xFFFFFFFF;
+	*pPTSL=0xFFFFFFFF;
+	*pDTSH=0xFFFFFFFF;
+	*pDTSL=0xFFFFFFFF;
+	if( bDisplay>0 )
+	{
+	fprintf( stdout, "------------------------\n" );
+	UINT addr = SrcAddr(g_addr,0);
+	if( addr==0xFFFFFFFF )
+	    fprintf( stdout, "PES_header(%s)\n", AddrStr(g_addr) );
+	else
+	    fprintf( stdout, "PES_header(%s)(0x%llX)\n", 
+	    	AddrStr(g_addr), SrcAddr(g_addr,1) );
+	}
+	readed = gread( buffer, 1, 2, fp );
+	len = (buffer[0]<<8) | buffer[1];
+	if( bDebugPES )
+	fprintf( stdout, "PES_len=%8X\n", len );
+	readed = gread( buffer, 1, 3, fp );
+	if( readed<3 )
+	{
+	    CannotRead( "PES header top" );
+	    return -1;
+	}
+	int PES_header_data_length = buffer[2];
+	int bPTS=0;
+	int bDTS=0;
+	int flag1=buffer[0];
+	int flag2=buffer[1];
+#if 0
+	if( (flag1>>6)!=2 )
+	    fprintf( stdout, "Invalid flag1 (%02X)\n", flag1 );
+#endif
+	bPTS = (flag2 & 0x80) ? 1 : 0;
+	bDTS = (flag2 & 0x40) ? 1 : 0;
+	flag1 = flag1 & 0x3F;
+	flag2 = flag2 & 0x3F;
+#if 0
+	fprintf( stdout, "%02X:%d,%d:%02X, %02X\n", 
+	    flag1, bPTS, bDTS, flag2, PES_header_data_length );
+#endif
+	offset=3;
+	if( bDebugPES )
+	fprintf( stdout, "PES_header_data_length=%d\n",
+		PES_header_data_length );
+
+	int head_addr = g_addr-offset;
+	int stAddr, enAddr;
+	readed = gread( &buffer[3], 1, PES_header_data_length, fp );
+	if( readed<PES_header_data_length )
+	{
+	    CannotRead( "PES header data" );
+	    return -1;
+	}
+//	return len;
+	int PTS_H=(-1), PTS_L=(-1), DTS_H=(-1), DTS_L=(-1);
+	if( bPTS )
+	{
+	    PTS_H = (buffer[offset+0]<< 0);
+	    PTS_L = (buffer[offset+1]<<24)
+		  | (buffer[offset+2]<<16)
+		  | (buffer[offset+3]<< 8)
+		  | (buffer[offset+4]<< 0);
+	    if( bDisplay>1 )
+	    fprintf( stdout, "PTS=%02X:%08X (%02X,%02X,%02X,%02X,%02X)\n",
+		    PTS_H, PTS_L, 
+		    buffer[offset+0], buffer[offset+1], 
+		    buffer[offset+2], buffer[offset+3],
+		    buffer[offset+4] );
+	    TS( PTS_H, PTS_L, pPTSH, pPTSL );
+	    if( bDisplay>1 )
+		fprintf( stdout, "PTS=%02X:%08X\n", *pPTSH, *pPTSL );
+
+	    stAddr = head_addr+offset+0;
+	    enAddr = head_addr+offset+5;
+	    if( bDisplay>0 )
+	    {
+	    	int hour, min, sec, msec;
+		TcTime32( *pPTSH, *pPTSL, &hour, &min, &sec, &msec );
+		fprintf( stdout, 
+			"PTS(%8X,%8X)=%8X,%08X (%3d:%02d:%02d.%03d)\n", 
+			stAddr, enAddr, *pPTSH, *pPTSL,
+			hour, min, sec, msec );
+	    }
+	    if( PtsOffset!=INVALID_OFFSET )
+	    {
+	    	if( ((fromPts!=INVALID_OFFSET) && (toPts!=INVALID_OFFSET)
+		  && (*pPTSL>=fromPts) && (*pPTSL<=toPts))
+
+		  || (((fromPts!=INVALID_OFFSET) && (toPts==INVALID_OFFSET))
+		  && (*pPTSL>=fromPts) )
+
+		  || (((fromPts==INVALID_OFFSET) && (toPts!=INVALID_OFFSET))
+		  && (*pPTSL<=toPts) )
+
+		  || ((fromPts==INVALID_OFFSET) && (toPts==INVALID_OFFSET))
+		)
+		{
+		UpdateTS( stAddr, *pPTSH, *pPTSL, MODE_PTS, 
+			bPTS, bDTS, PtsOffset );
+#if 0
+		fprintf( stdout, "PtsUpdate(%8X,%8X)\n", PTSL, PtsOffset );
+#endif
+		}
+	    }
+	    offset+=5;
+	} else {
+#if 0
+	    if( bDump )
+		fprintf( stdout, "No PTS\n" );
+#endif
+	}
+	if( bDTS )
+	{
+	    DTS_H = (buffer[offset+0]<< 0);
+	    DTS_L = (buffer[offset+1]<<24)
+		  | (buffer[offset+2]<<16)
+		  | (buffer[offset+3]<< 8)
+		  | (buffer[offset+4]<< 0);
+	    if( bDisplay>1 )
+		fprintf( stdout, "DTS=%02X:%08X (%02X,%02X,%02X,%02X,%02X)\n",
+		    DTS_H, DTS_L, 
+		    buffer[offset+0], buffer[offset+1], 
+		    buffer[offset+2], buffer[offset+3],
+		    buffer[offset+4] );
+	    TS( DTS_H, DTS_L, pDTSH, pDTSL );
+	    if( bDisplay>1 )
+		fprintf( stdout, "DTS=%02X:%08X\n", *pDTSH, *pDTSL );
+
+	    stAddr = head_addr+offset+0;
+	    enAddr = head_addr+offset+5;
+	    if( bDisplay>0 )
+	    {
+	    	int hour, min, sec, msec;
+		TcTime32( *pDTSH, *pDTSL, &hour, &min, &sec, &msec );
+		fprintf( stdout, 
+			"DTS(%8X,%8X)=%8X,%08X (%3d:%02d:%02d.%03d)\n", 
+			stAddr, enAddr, *pDTSH, *pDTSL, hour, min, sec, msec );
+	    }
+	    if( DtsOffset!=INVALID_OFFSET )
+	    {
+	    	if( ((fromDts!=INVALID_OFFSET) && (toDts!=INVALID_OFFSET)
+		  && (*pDTSL>=fromDts) && (*pDTSL<=toDts))
+
+		  || (((fromDts!=INVALID_OFFSET) && (toDts==INVALID_OFFSET))
+		  && (*pDTSL>=fromDts) )
+
+		  || (((fromDts==INVALID_OFFSET) && (toDts!=INVALID_OFFSET))
+		  && (*pDTSL<=toDts) )
+
+		  || ((fromDts==INVALID_OFFSET) && (toDts==INVALID_OFFSET))
+		)
+		UpdateTS( stAddr, *pDTSH, *pDTSL, MODE_DTS, 
+			bPTS, bDTS, DtsOffset );
+	    }
+
+	    offset+=5;
+	} else {
+#if 0
+	    if( bDump )
+		fprintf( stdout, "No DTS\n" );
+#endif
+	}
+	if( bDisplay )
+	{
+	    if( bPTS & bDTS )
+	    {
+		fprintf( stdout, "PTSDTS=%02X:%08X,%02X:%08X diff(%5d)\n",
+		    *pPTSH, *pPTSL, *pDTSH, *pDTSL, (*pPTSL-*pDTSL) );
+	    } else if( bPTS )
+	    {
+		fprintf( stdout, "PTSDTS=%02X:%08X,--:-------- diff(%5d)\n",
+		    *pPTSH, *pPTSL, 0 );
+	    } else if( bDTS )
+	    {
+		fprintf( stdout, "PTSDTS=--:--------,%02X:%08X diff(  ?  )\n",
+		    *pDTSH, *pDTSL );
+	    }
+	    if( bDisplay>0 )
+		fprintf( stdout, "------------------------\n" );
+	}
+#if 0
+	userdata_ptsh = *pPTSH;
+	userdata_ptsl = *pPTSL;
+#endif
+	g_PTSL =  *pPTSL;
+	g_PTSH =  *pPTSH;
+	if( *pDTSH==0xFFFFFFFF )
+	{
+	    g_DTSL = *pPTSL;
+	    g_DTSH = *pPTSH;
+	} else {
+	    g_DTSL = *pDTSL;
+	    g_DTSH = *pDTSH;
+	}
+
+	return len;
+}
+

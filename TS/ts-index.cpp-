@@ -1,0 +1,955 @@
+
+/*
+	ts-index.cpp
+		2013.4.22 by T.Oda
+		2013.4.23 +E : bAddEOS
+		2013.4.24 Correct EndPts check and break position
+		2013.4.24 print "." while GetIndex
+		2013.5. 2 output min_PTS/max_PTS to index file
+		2013.6. 7 show slice_type in character
+		2013.6.14 +A : nAddFrame
+		2013.6.19 +A -> Compare DTS 
+		2013.6.19 +P -> bPrev (2GOP)
+		2013.6.21 +M : bMake=1
+		2013.6.21 +s : bFromStart
+		2013.6.21 +e : bToEnd
+		2013.7. 1 =AVC  : AVC 
+		          =MPEG : MPEG
+			  show PTS as hour:min:sec.ms
+*/
+
+#include <stdio.h>
+#include <stdlib.h>	// exit
+#include <string.h>	// strncmp
+#include <sys/time.h>	// gettimeofday
+
+#include "tsLib.h"
+#include "parseLib.h"
+#include "lib.h"
+
+// -----------------------------------------
+int bDebug=0;
+int bShowNonKey=0;
+int bAddEOS=0;
+int nAddFrame=0;
+
+//
+// -----------------------------------------
+
+#define BIT_BUFFER_SIZE 1024
+static unsigned char BitBuffer[BIT_BUFFER_SIZE];
+static unsigned int BitAddr = 0;
+static int BitOffset=0;
+static int BitReaded=0;
+static int BitSkip  =0;
+static int nZero=0;
+static int bAVC=0;
+
+void InitBitBuffer( )
+{
+	BitAddr  = g_addr;
+	BitOffset= 0;
+	BitReaded= 0;
+	BitSkip  = 0;
+	nZero    = 0;
+}
+int GetBitFromBuffer( unsigned char *buffer, int *pBufOffset, int nBit )
+{
+static unsigned char BitMask[] = {
+0xFF, 0x7F, 0x3F, 0x1F, 0x0F, 0x07, 0x03, 0x01
+};
+	int bufOffset = *pBufOffset;
+	if( bDebug )
+	fprintf( stdout, "GetBitStream(%d)\n", nBit );
+	int nPos = BitOffset/8;
+	if( (BitReaded/8)>=BIT_BUFFER_SIZE )
+	{
+	    fprintf( stdout, "BitBuffer full (%d)\n", BitReaded );
+	    EXIT();
+	}
+	if( (BitOffset+nBit)>BitReaded )
+	{
+	    int ii;
+	    int nByte = BitOffset+nBit-BitReaded;
+	    nByte = (nByte+7)/8;
+	    if( bDebug )
+	    fprintf( stdout, "Requested %d bytes (%d)\n", 
+	    	nByte, BitReaded );
+	    memcpy( &BitBuffer[BitReaded/8], &buffer[bufOffset], nByte );
+	    bufOffset+=nByte;
+	    for( ii=0; ii<nByte; ii++ )
+	    {
+	    	if( nZero==2 )
+		{
+		    if( BitBuffer[BitReaded/8+ii]==3 )
+		    {
+		    	// 00 00 03
+			if( bDebug )
+			    fprintf( stdout, "Found(00 00 03)@0x%X+%d/8\n",
+				BitAddr, BitOffset );
+			BitSkip++;
+			int jj;
+			for( jj=ii; jj<nByte; jj++ )
+			{
+			    BitBuffer[BitReaded/8+jj] 
+			    	= BitBuffer[BitReaded/8+jj+1];
+			}
+			memcpy( &BitBuffer[BitReaded/8+nByte-1], 
+			    &buffer[bufOffset], 1 );
+			bufOffset+=1;
+			nZero=0;
+//			break;	// comment out 2012.8.23
+		    }
+		}
+	    	if( BitBuffer[BitReaded/8+ii] == 0 )
+		    nZero++;
+		else
+		    nZero=0;
+	    }
+	    if( bDebug )
+	    {
+	    for( ii=0; ii<nByte; ii++ )
+	    {
+	    	fprintf( stdout, "%02X ", BitBuffer[BitReaded/8+ii] );
+	    }
+	    fprintf( stdout, "\n" );
+	    }
+	    BitReaded += nByte*8;
+	}
+	unsigned int data=0;
+	int rBit = nBit+BitOffset-nPos*8;
+	int rP = 0;
+	int data8 = (-1);
+	while( rBit>0 )
+	{
+	    data = (data<<8) | BitBuffer[nPos+rP]; 
+	    data8= BitBuffer[nPos+rP];
+	    if( rP==0 )
+	    {
+	    	if( BitOffset%8 )
+		    data = data & BitMask[BitOffset%8];
+	    }
+	    rBit-=8;
+	    rP++;
+	}
+	BitOffset += nBit;
+	if( rBit<0 )
+	    data = data>>(-rBit);
+	if( bDebugGolB )
+	{
+	    int n;
+	    int mask = 1<<(nBit-1);
+	    int v = data;
+	    for( n=0; n<nBit; n++ )
+	    {
+	    	if( v & mask )
+		    fprintf( stdout, "1 " );
+		else
+		    fprintf( stdout, "0 " );
+		v=v<<1;
+	    }
+	    fprintf( stdout, "\n" );
+	}
+
+	if( bDebug )
+	fprintf( stdout, "BitOffset=%d, BitReaded=%d, data=0x%X(0x%X)\n",
+		BitOffset, BitReaded, data, data8 );
+	*pBufOffset = bufOffset;
+
+	return data;
+}
+
+#define MAX_BASE	30
+static int base[MAX_BASE];
+int GetGolombFromBuffer( unsigned char *buffer, int *pBufOffset )
+{
+int nBit;
+int i, n;
+int bValue, value=0;
+/*
+static int base[] = {
+	0, 1, 3, 7, 15, 31, 
+};
+*/
+	if( bShowGolomb )
+	fprintf( stdout, "Golomb:" );
+	if( base[1]==0 )
+	{
+	    for( n=1; n<MAX_BASE; n++ )
+	    {
+		base[n] = base[n-1]*2+1;
+	    }
+	}
+	bDebugGolB = 0;
+	for( n=0; n<MAX_BASE; n++ )
+	{
+	    nBit = GetBitFromBuffer( buffer, pBufOffset, 1 );
+	    if( bShowGolomb )
+	    fprintf( stdout, "%d ", nBit );
+	    if( nBit==1 )
+	    	break;
+	}
+	if( n>=MAX_BASE )
+	{
+	    fprintf( stdout, "Invalid Golomb\n" );
+	    return -1;
+	}
+	bValue = 0;
+	for( i=0; i<n; i++ )
+	{
+	    nBit = GetBitFromBuffer( buffer, pBufOffset, 1 );
+	    if( bShowGolomb )
+	    fprintf( stdout, "%d ", nBit );
+	    bValue = (bValue<<1) | nBit;
+	}
+	bDebugGolB = bDebugGol;
+	value = base[n] + bValue;
+	if( bShowGolomb )
+	fprintf( stdout, " : value=%d (%X,%d=%X,%d)\n", 
+		value, BitAddr, BitOffset, BitAddr+BitOffset/8, BitOffset%8 );
+	return value;
+}
+
+int GetIndex( char *filename, char *indexFilename, int PID )
+{
+unsigned char buffer[1024];
+struct timeval timeval0, timeval1, timevalc;
+
+	fprintf( stdout, "GetIndex(%s:PID=%d)\n", filename, PID );
+	gettimeofday( &timeval0, NULL );
+	timeval1 = timeval0;
+	FILE *fp = fopen( filename, "rb" );
+	if( fp==NULL )
+	{
+	    fprintf( stdout, "Can't open [%s]\n", filename );
+	    exit( 1 );
+	}
+	FILE *pKey = fopen( indexFilename, "wb" );
+	if( pKey==NULL )
+	{
+	    fprintf( stdout, "Can't write %s\n", indexFilename );
+	    exit( 1 );
+	}
+
+	int nPacket=0;
+	int Pid=(-1);
+	int state=0;
+	int nal_unit_type=(-1);
+	int nSlice=0;
+	int last_header=0;
+	unsigned int PTSH=0xFFFFFFFF, PTSL=0xFFFFFFFF;
+	unsigned int DTSH=0xFFFFFFFF, DTSL=0xFFFFFFFF;
+	unsigned int PTS=0xFFFFFFFF;
+	unsigned int DTS=0xFFFFFFFF;
+	unsigned int min_PTS=0xFFFFFFFF;
+	unsigned int max_PTS=0;
+	while( 1 )
+	{
+	    gettimeofday( &timevalc, NULL );
+	    int tt;
+	    tt = (timevalc.tv_sec -timeval1.tv_sec )*1000;
+	    tt +=(timevalc.tv_usec-timeval1.tv_usec)/1000;
+	    if( tt>1000 )
+	    {
+#if 0
+	    	fprintf( stderr, "." );
+		fflush( stderr );
+#endif
+	    	timeval1=timevalc;
+	    }
+	    int readed = gread( buffer, 1, 188, fp );
+	    if( readed<188 )
+	    {
+//	    	fprintf( stdout, "EOF\n" );
+		break;
+	    }
+	    if( buffer[0]!=0x47 )
+	    {
+	    	fprintf( stdout, "Not TS\n" );
+		exit( 1 );
+	    }
+	    Pid=((buffer[1]<<8) | buffer[2]) & 0x1FFF;
+	    if( bDebug )
+	    if( Pid!=0x1FFF )
+	    fprintf( stdout, "Pid=%4d(%X)\n", Pid, g_addr-188 );
+	    if( Pid==PID )
+	    {
+		int adapt = (buffer[3]>>4)& 3;
+		int count = (buffer[3]>>0)&15;
+		int adapt_len = buffer[4];
+		int bAdapt=0;
+		int bPayload=0;
+		switch( adapt )
+		{
+		case 1 :
+		    bAdapt = 0;
+		    bPayload=1;
+		    break;
+		case 3 :
+		    bAdapt = 1;
+		    bPayload=1;
+		    break;
+		}
+		int offset=0;
+		if( bAdapt )
+		    offset = adapt_len+1;
+
+		int offset2=0;
+	    	if( (buffer[4+offset]==0x00)
+	    	 && (buffer[5+offset]==0x00)
+	    	 && (buffer[6+offset]==0x01)
+	    	 && (buffer[7+offset]>=0xE0) && (buffer[7+offset]<=0xEF) )
+		{	// PES header
+		    if( bDebug )
+		    fprintf( stdout, "PES_header(%X)\n", g_addr );
+		    int len = parsePES_header( &buffer[8+offset], 0,
+		    	&PTSH, &PTSL, &DTSH, &DTSL, &offset2 );
+		    if( bDebug )
+			fprintf( stdout, "len=%d\n", len );
+		    if( PTSH!=0xFFFFFFFF )
+		    {
+		    	if( DTSH==0xFFFFFFFF )
+			    DTS=DTSL;
+			else
+			    DTS=PTSL;
+			PTS=PTSL;
+			if( PTS<min_PTS )
+			    min_PTS = PTS;
+			if( PTS>max_PTS )
+			    max_PTS = PTS;
+		    	if( bDebug )
+		    	fprintf( stdout, "%8X : %08X:%08X,%08X:%08X\n",
+				g_addr-188, PTSH, PTSL, DTSH, DTSL );
+		    }
+		    offset2+=8;
+		    last_header = g_addr-188;
+		} else {
+		    offset2=4;
+		}
+		int ii;
+		int ms= PTS/90;
+		int s = ms/1000;
+		int m = s/60;
+		int h = m/60;
+#if 0
+		for( ii=0; ii<16; ii++ )
+		{
+		    fprintf( stdout, "%02X ", buffer[offset+ii] );
+		}
+		fprintf( stdout, "\n" );
+#endif
+		for( ii=offset+offset2; ii<188; ii++ )
+		{
+		    switch( state )
+		    {
+		    case 0 :
+		    	if( buffer[ii]==0x00 )
+			    state=1;
+			break;
+		    case 1 :	// 00
+		    	if( buffer[ii]==0x00 )
+			    state=2;
+			else
+			    state=0;
+			break;
+		    case 2 :	// 00 00
+		    	if( buffer[ii]==0x00 )
+			{
+			} else if( buffer[ii]==0x01 )
+			{
+			    state=3;
+			} else {
+			    state=0;
+			}
+			break;
+		    case 3 :	// 00 00 01
+		    	if( bAVC )
+			{
+			    nal_unit_type = buffer[ii]&0x1F;
+			    switch( nal_unit_type )
+			    {
+			    case 5 :
+				if( nSlice==0 )
+				{
+				    if( bDebug )
+					fprintf( stdout, "IDR\n" );
+				    fprintf( stdout, 
+			    "%8X : KEY(IDR) PTS=%08X (%2d:%02d:%02d.%03d)\n",
+				    last_header, PTS, h, m%60, s%60, ms%1000 );
+				    if( pKey )
+				    fprintf( pKey, "%8X : KEY(IDR) PTS=%08X\n",
+					    last_header, PTS );
+				}
+				nSlice++;
+				break;
+			    case 1 :
+				if( nSlice==0 )
+				{
+    char SliceType[10][3] = { 
+	"P", "B", "I", 
+	"SP", "SI", 
+	"P", "B", "I", 
+	"SP", "SI" };
+				    if( bDebug )
+					fprintf( stdout, "non IDR\n" );
+				    InitBitBuffer( );
+	    int bufOffset=0;
+    int first_mb_in_slice    = GetGolombFromBuffer( &buffer[ii+1], &bufOffset );
+    int slice_type           = GetGolombFromBuffer( &buffer[ii+1], &bufOffset );
+    int pic_parameter_set_id = GetGolombFromBuffer( &buffer[ii+1], &bufOffset );
+    if( bDebug )
+    {
+    fprintf( stdout, "first_mb_in_slice=%d\n", first_mb_in_slice );
+    fprintf( stdout, "slice_type=%d\n", slice_type );
+    fprintf( stdout, "pic_parameter_set_id=%d\n", pic_parameter_set_id );
+    }
+
+				    if( (slice_type==2) || (slice_type==7) )
+				    {
+				    fprintf( stdout, 
+			    "%8X : KEY( I ) PTS=%08X (%2d:%02d:%02d.%03d)\n",
+				    last_header, PTS, h, m%60, s%60, ms%1000 );
+				    if( pKey )
+				    fprintf( pKey, "%8X : KEY( I ) PTS=%08X\n",
+					    last_header, PTS );
+				    } else {
+				    if( bShowNonKey )
+				    fprintf( stdout, 
+				    	"%8X :  - (%2s ) PTS=%08X\n",
+					last_header, SliceType[slice_type], 
+					PTS );
+				    }
+				}
+				nSlice++;
+				break;
+			    case 6 :
+				if( bDebug )
+				fprintf( stdout, "SEI\n" );
+				break;
+			    case 7 :
+				if( bDebug )
+				fprintf( stdout, "SPS\n" );
+				break;
+			    case 8 :
+				if( bDebug )
+				fprintf( stdout, "PPS\n" );
+				break;
+			    case 9 :
+				if( bDebug )
+				fprintf( stdout, "AUD\n" );
+				nSlice=0;
+				break;
+			    case 12 :
+				if( bDebug )
+				fprintf( stdout, "filler\n" );
+				break;
+			    default :
+				fprintf( stdout, 
+				    "nal_unit_type=%2d\n", nal_unit_type );
+				break;
+			    }
+			} else {
+			    if( buffer[ii]==0x00 )
+			    {	// Picture
+//				TR   = GetBitStream( fp,10 );
+//				PCT  = GetBitStream( fp, 3 );
+				int TR = (buffer[ii+1]<<2)
+				       | (buffer[ii+2]>>6);
+			        int PCT= (buffer[ii+2]>>3) & 7;
+#if 0
+				fprintf( stdout, "%02X %02X TR=%2d PCT=%d\n", 
+					buffer[ii+1],
+					buffer[ii+2],
+					TR,
+					PCT );
+#endif
+				if( PCT==1 )
+				{
+				    fprintf( stdout, 
+			    "%8X : KEY( I ) PTS=%08X (%2d:%02d:%02d.%03d)\n",
+				    last_header, PTS, h, m%60, s%60, ms%1000 );
+				    if( pKey )
+				    fprintf( pKey, "%8X : KEY( I ) PTS=%08X\n",
+						last_header, PTS );
+				} else {
+			    static char PctStr[4][2] = { "-", "I", "P", "B" };
+				    if( bShowNonKey )
+					fprintf( stdout, 
+					    "%8X :  - ( %s ) PTS=%08X\n",
+					    last_header, PctStr[PCT], 
+					    PTS );
+				}
+			    }
+			}
+			state = 0;
+			break;
+		    }
+		}
+	    }
+	    nPacket++;
+	}
+	fprintf( stdout, "\n" );
+	fprintf( stdout, "%d packets\n", nPacket );
+	fprintf( stdout, "min_PTS=%08X\n", min_PTS );
+	fprintf( stdout, "max_PTS=%08X\n", max_PTS );
+	if( pKey )
+	{
+	fprintf( pKey, "   -     : Last     PTS=%08X\n", PTS );
+	fprintf( pKey, "min_PTS=%08X\n", min_PTS );
+	fprintf( pKey, "max_PTS=%08X\n", max_PTS );
+	}
+
+	fclose( fp );
+	if( pKey )
+	    fclose( pKey );
+	return 0;
+}
+int GetPes( char *filename, char *outfilename,
+	unsigned int seekOffset, int PID, int EndPts )
+{
+unsigned char buffer[1024];
+
+	int bEnd = 0;
+	fprintf( stdout, "GetPes(Offset=0x%X,PID=0x%X,End=0x%X)\n",
+		seekOffset, PID, EndPts );
+	FILE *fp = fopen( filename, "rb" );
+	if( fp==NULL )
+	{
+	    fprintf( stdout, "Can't open %s\n", filename );
+	    exit( 1 );
+	}
+	FILE *pOut = fopen( outfilename, "wb" );
+	if( pOut==NULL )
+	    fprintf( stdout, "Can't write %s\n", outfilename );
+	fseek( fp, seekOffset, SEEK_SET );
+	fprintf( stdout, "EndPts=0x%X, seek@0x%X\n", EndPts, seekOffset );
+
+	int nPacket=0;
+	int Pid=(-1);
+	int last_header=0;
+	unsigned int PTSH=0xFFFFFFFF, PTSL=0xFFFFFFFF;
+	unsigned int DTSH=0xFFFFFFFF, DTSL=0xFFFFFFFF;
+	unsigned int PTS=0xFFFFFFFF;
+	unsigned int DTS=0xFFFFFFFF;
+	while( 1 )
+	{
+	    int readed = gread( buffer, 1, 188, fp );
+	    if( readed<188 )
+	    {
+//	    	fprintf( stdout, "EOF\n" );
+		break;
+	    }
+	    if( buffer[0]!=0x47 )
+	    {
+	    	fprintf( stdout, "Not TS\n" );
+		exit( 1 );
+	    }
+	    int adapt     = (buffer[3]>>4)&3;
+	    int adapt_len = buffer[4];
+	    int bPayload=0;
+	    int ts_offset=0;
+	    switch( adapt )
+	    {
+	    case 0 :
+		break;
+	    case 1 :	// no adapt
+	    	bPayload=1;
+		ts_offset=4;
+		break;
+	    case 2 :	// adapt
+		break;
+	    case 3 :	// adapt+payload
+	    	bPayload=1;
+		ts_offset=5+adapt_len;
+		break;
+	    }
+	    Pid=((buffer[1]<<8) | buffer[2]) & 0x1FFF;
+	    if( (Pid==PID) && bPayload )
+	    {
+	    	if( (buffer[ts_offset+0]==0x00)
+	    	 && (buffer[ts_offset+1]==0x00)
+	    	 && (buffer[ts_offset+2]==0x01)
+	    	 && (buffer[ts_offset+3]>=0xE0) 
+		 && (buffer[ts_offset+3]<=0xEF) )
+		{	// PES header
+		    int offset;
+		    int len = parsePES_header( &buffer[ts_offset+4], 0,
+		    	&PTSH, &PTSL, &DTSH, &DTSL, &offset );
+		    if( bDebug )
+			fprintf( stdout, "len=%d\n", len );
+		    if( PTSH!=0xFFFFFFFF )
+		    {
+#if 0
+		    	if( DTSH==0xFFFFFFFF )
+			    DTS=DTSL;
+			else
+			    DTS=PTSL;
+#else
+		    	if( DTSH!=0xFFFFFFFF )
+			    DTS=DTSL;
+			else
+			    DTS=PTSL;
+#endif
+			PTS=PTSL;
+		    	if( bDebug )
+		    	fprintf( stdout, "%8X : %08X:%08X,%08X:%08X\n",
+				g_addr-188, PTSH, PTSL, DTSH, DTSL );
+		    }
+		    last_header = g_addr-188;
+		}
+		if( PTS==EndPts )
+		    bEnd = 1;
+		int bDone=0;
+		if( nAddFrame==0 )
+		{
+		    if( ((PTS>EndPts) && bEnd) || (PTS>(EndPts+3000*6)) )
+		    	bDone=1;
+		} else {
+//		    if( (PTS>(EndPts+3000*nAddFrame)) )
+		    if( (DTS>(EndPts+3000*nAddFrame)) )
+		    {
+		    	fprintf( stdout, "Found DTS=%8X > %8X\n",
+				DTS, (EndPts+3000*nAddFrame) );
+		    	bDone=1;
+		    }
+		}
+		if( bDone )
+		{
+		    fprintf( stdout, "EndPts=%8X, PTS=%08X\n", EndPts, PTS );
+		    fprintf( stdout, "offset=%8X, last=%8X\n", 
+		    	seekOffset, g_addr+seekOffset );
+		    break;
+		}
+#if 1
+		if( pOut )
+		{
+		fwrite( &buffer[ts_offset], 1, 188-ts_offset, pOut );
+//		fprintf( stdout, "output(%d)\n", nPacket );
+		}
+#else
+		int ii;
+		for( ii=ts_offset; ii<188; ii++ )
+		{
+		    fprintf( stdout, "%02X ", buffer[ii] );
+		}
+#endif
+	    }
+	    nPacket++;
+	}
+	fclose( fp );
+	if( pOut )
+	{
+	    if( bAddEOS )
+	    {
+	    	if( bAVC )
+		{
+		    buffer[0] = 0x00;
+		    buffer[1] = 0x00;
+		    buffer[2] = 0x01;
+		    buffer[3] = 0x0A;
+		    fwrite( buffer, 1, 4, pOut );
+		} else {	// MPEG
+		    buffer[0] = 0x00;
+		    buffer[1] = 0x00;
+		    buffer[2] = 0x01;
+		    buffer[3] = 0xB7;
+		    fwrite( buffer, 1, 4, pOut );
+		}
+	    }
+	    fclose( pOut );
+	}
+	return 0;
+}
+
+// -----------------------------------------
+void Usage( char *prg )
+{
+	fprintf( stdout, "%s filename -Ppid\n", prg );
+	exit( 1 );
+}
+
+int main( int argc, char *argv[] )
+{
+int i;
+int args=0;
+char *filename=NULL;
+int PID=(-1);
+FILE *pKey=NULL;
+int FirstPts=(-1);
+int Prev_Pts=(-1);
+int Error=0;
+char outfilename[1024];
+int bEndGop=0;
+int bPrev=0;
+int bMake=0;
+int bFromStart=0;
+int bToEnd=0;
+
+	sprintf( outfilename, "out.pes" );
+	for( i=1; i<argc; i++ )
+	{
+//	    fprintf( stdout, "argv[%d][0] = %c\n", i, argv[i][0] );
+	    if( argv[i][0]=='-' )
+	    {
+	    	switch( argv[i][1] )
+		{
+		case 'P' :
+		    PID = GetValue( &argv[i][2], &Error );
+		    fprintf( stdout, "PID=%d\n", PID );
+		    break;
+		default :
+		fprintf( stdout, "Parse param -\n" );
+		    Usage( argv[0] );
+		    break;
+		}
+	    } else if( argv[i][0]=='+' )
+	    {
+	    	switch( argv[i][1] )
+		{
+		case 'D' :
+		    bDebug=1;
+		    break;
+		case 'E' :
+		    bAddEOS=1;
+		    break;
+		case 'N' :
+		    bShowNonKey=1;
+		    break;
+		case 'A' :
+		    nAddFrame = atoi( &argv[i][2] );
+		    if( nAddFrame<1 )
+			nAddFrame=1;
+		    break;
+		case 'O' :
+		    sprintf( outfilename, "%s", &argv[i][2] );
+		    break;
+		case 'G' :
+		    bEndGop=1;
+		    break;
+		case 'P' :
+		    bPrev=1;
+		    break;
+		case 'M' :
+		    bMake=1;
+		    break;
+		case 's' :
+		    bFromStart=1;
+		    break;
+		case 'e' :
+		    bToEnd=1;
+		    break;
+		default :
+		fprintf( stdout, "Parse param +\n" );
+		    Usage( argv[0] );
+		    break;
+		}
+#if 0
+	    } else if( argv[i][0]=='/' )
+	    {
+	    	switch( argv[i][1] )
+		{
+		default :
+		fprintf( stdout, "Parse param /\n" );
+		    Usage( argv[0] );
+		    break;
+		}
+#endif
+	    } else if( argv[i][0]=='=' )
+	    {
+	    	switch( argv[i][1] )
+		{
+		case 'A' :
+		    bAVC=1;
+		    break;
+		case 'M' :
+		    bAVC=0;
+		    break;
+		default :
+		fprintf( stdout, "Parse param =\n" );
+		    Usage( argv[0] );
+		    break;
+		}
+	    } else {
+		switch( args )
+		{
+		case 0 :
+		    filename=argv[i];
+		    break;
+		case 1 :
+		    FirstPts = GetValue( argv[i], &Error );
+		    break;
+		case 2 :
+		    Prev_Pts = GetValue( argv[i], &Error );
+		    break;
+		default :
+		fprintf( stdout, "Parse args=%d\n", args );
+		    Usage( argv[0] );
+		    break;
+		}
+		args++;
+	    }
+	}
+
+	if( filename==NULL )
+	{
+	    fprintf( stdout, "No filename\n" );
+	    Usage( argv[0] );
+	}
+	if( PID<0 )
+	{
+	    fprintf( stdout, "No PID\n" );
+	    Usage( argv[0] );
+	}
+
+	unsigned int index[1024*64][2];
+	int nIndex=0;
+	unsigned int LastPts=0;
+
+	static char indexFilename[] = "index.txt";
+
+	if( bMake )
+	    GetIndex( filename, indexFilename, PID );
+
+	pKey = fopen( indexFilename, "rb" );
+	char buffer[1024];
+	if( pKey )
+	{
+	    fprintf( stdout, "index (%s) exist\n", indexFilename );
+	    unsigned int PTS=0xFFFFFFFF;
+	    unsigned int min_PTS=0xFFFFFFFF;
+	    unsigned int max_PTS=0;
+	    while( 1 )
+	    {
+	    	PTS=0xFFFFFFFF;
+	    	if( fgets( buffer, 1024, pKey )==NULL )
+		    break;
+		if( strncmp( &buffer[8], " : KEY(IDR) ", 12 )==0)
+		{
+		    sscanf( buffer, "%X : KEY(IDR) PTS= %X",
+			&index[nIndex][0], &index[nIndex][1] );
+		    PTS = index[nIndex][1];
+		} else if(strncmp( &buffer[8], " : KEY( I ) ", 12 )==0)
+		{
+		    sscanf( buffer, "%X : KEY( I ) PTS= %X",
+			&index[nIndex][0], &index[nIndex][1] );
+		    PTS = index[nIndex][1];
+		} else if( strncmp( &buffer[8], " : Last     ", 12 )==0 )
+		{
+		    sscanf( buffer, " - : Last     PTS= %X", &LastPts );
+		    fprintf( stdout, "LastPts=%8X\n", LastPts );
+		    break;
+		} else {
+			fprintf( stdout, "Can't parse %s", buffer );
+		}
+		if( PTS!=0xFFFFFFFF )
+		{
+		    if( PTS<min_PTS )
+			min_PTS = PTS;
+		    if( PTS>max_PTS )
+			max_PTS = PTS;
+		}
+		nIndex++;
+	    }
+	    fclose( pKey );
+	    fprintf( stdout, "min_PTS=%08X\n", min_PTS );
+	    fprintf( stdout, "max_PTS=%08X\n", max_PTS );
+	    unsigned int offset = 0;
+	    unsigned int prev_offset = (-1);
+	    unsigned int keyPts = 0;
+	    if( Prev_Pts>0 )
+	    {
+	    	for( i=1; i<nIndex; i++ )
+		{
+		    prev_offset = index[i-1][0];
+		    if( index[i][1]>Prev_Pts )
+		    {
+		    	fprintf( stdout, "Prev_Pts=%8X\n", Prev_Pts );
+		    	fprintf( stdout, "%8X : KEY(IDR) PTS=%08X\n",
+				prev_offset, index[i-1][1] );
+		    	break;
+		    }
+		}
+	    }
+	    if( FirstPts>0 )
+	    {
+	    	int bNextKey=0;
+		int nextOffset = 0;
+	    	int nextKeyPts = 0;
+		int prevOffset = (-1);
+		int prevKeyPts = 0;
+		fprintf( stdout, "FirstPts=%8X\n", FirstPts );
+	    	for( i=1; i<=nIndex; i++ )
+		{
+		    offset     = index[i-1][0];
+		    keyPts     = index[i-1][1];
+		    if( i==nIndex )
+		    {
+			nextOffset = -1;
+			nextKeyPts = -1;
+		    } else {
+			nextOffset = index[i][0];
+			nextKeyPts = index[i][1];
+		    }
+		    fprintf( stdout, 
+			"offset=%8X, keyPts=%8X, nextKeyPts=%8X\n",
+			offset, keyPts, nextKeyPts );
+		    if( nextKeyPts>FirstPts )
+		    {
+		    	bNextKey=1;
+		    	break;
+		    }
+		    if( nextKeyPts<0 )
+		    	break;
+		    prevOffset = offset;
+		    prevKeyPts = keyPts;
+		}
+		if( bPrev>0 )
+		{
+		    if( prevOffset>=0 )
+		    {
+		    offset = prevOffset;
+		    keyPts = prevKeyPts;
+		    }
+		}
+		if( bNextKey==0 )
+		{
+		    nextKeyPts = LastPts;
+		}
+		if( bFromStart )
+		    offset = 0;
+		int s = keyPts/90000;
+		int m = s/60;
+		int h = m/60;
+		fprintf( stdout, "%8X : KEY(IDR) PTS=%08X (%2d:%02d:%02d)\n", 
+			offset, keyPts, h, m%60, s%60 );
+		if( offset == prev_offset )
+		{
+		    fprintf( stdout, "Same offset\n" );
+		} else {
+		    if( bToEnd )
+		    {
+			GetPes( filename, outfilename,
+			    offset, PID, LastPts );
+		    } else if( bEndGop )
+		    {
+			GetPes( filename, outfilename,
+			    offset, PID, nextKeyPts );
+		    } else {
+			GetPes( filename, outfilename,
+    #if 1
+			    offset, PID, FirstPts );
+    #else
+			    offset, PID, FirstPts+3000*6 );
+    #endif
+		    }
+		}
+	    } else {
+		    GetPes( filename, outfilename, 0, PID, LastPts );
+	    }
+	} else {
+	    GetIndex( filename, indexFilename, PID );
+	}
+
+	return 0;
+}
+
